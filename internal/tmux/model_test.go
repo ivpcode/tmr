@@ -1,6 +1,8 @@
 package tmux
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -25,19 +27,18 @@ func TestNewSessionAutoName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Kill(sess.Name)
-	if sess.Name != "0" {
-		t.Errorf("auto name = %q, want 0", sess.Name)
+	defer s.Kill(sess.Name())
+	if sess.Name() != "0" {
+		t.Errorf("auto name = %q, want 0", sess.Name())
 	}
 }
 
 func TestNewSessionDuplicate(t *testing.T) {
 	s := NewServer(nil)
-	sess, err := s.NewSession("work", longCmd, 80, 24)
-	if err != nil {
+	if _, err := s.NewSession("work", longCmd, 80, 24); err != nil {
 		t.Fatal(err)
 	}
-	defer s.Kill(sess.Name)
+	defer s.Kill("work")
 	if _, err := s.NewSession("work", longCmd, 80, 24); err == nil {
 		t.Error("expected duplicate session error")
 	}
@@ -53,7 +54,7 @@ func TestListOrder(t *testing.T) {
 	}
 	got := s.List()
 	if len(got) != 3 || got[0].Name != "a" || got[1].Name != "b" || got[2].Name != "c" {
-		t.Errorf("list order wrong: %v", names(got))
+		t.Errorf("list order wrong: %+v", got)
 	}
 }
 
@@ -77,6 +78,41 @@ func TestRename(t *testing.T) {
 	}
 }
 
+// TestConcurrentRenameAndList exercises the Rename/List/Name paths together;
+// run with -race to prove name accesses are properly guarded.
+func TestConcurrentRenameAndList(t *testing.T) {
+	s := NewServer(nil)
+	sess, err := s.NewSession("a0", longCmd, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= 50; i++ {
+			cur := fmt.Sprintf("a%d", i-1)
+			next := fmt.Sprintf("a%d", i)
+			if err := s.Rename(cur, next); err != nil {
+				t.Errorf("rename %s -> %s: %v", cur, next, err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			for _, info := range s.List() {
+				_ = info.Name
+			}
+			_ = sess.Name()
+		}
+	}()
+	wg.Wait()
+	s.Kill(sess.Name())
+}
+
 func TestKillRemoves(t *testing.T) {
 	s := NewServer(nil)
 	if _, err := s.NewSession("work", longCmd, 80, 24); err != nil {
@@ -89,6 +125,21 @@ func TestKillRemoves(t *testing.T) {
 	if err := s.Kill("work"); err == nil {
 		t.Error("expected error killing removed session")
 	}
+}
+
+// TestKillGroup verifies kill takes down the session's descendants too: a shell
+// that spawned a child must not leave the child running.
+func TestKillGroup(t *testing.T) {
+	s := NewServer(nil)
+	// The shell spawns a sleep and waits on it; both are in the pty's group.
+	if _, err := s.NewSession("g", []string{"sh", "-c", "sleep 60 & wait"}, 80, 24); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // let the shell fork the sleep
+	if err := s.Kill("g"); err != nil {
+		t.Fatal(err)
+	}
+	waitGone(t, s, "g")
 }
 
 func TestOnEmptyCalled(t *testing.T) {
@@ -105,10 +156,45 @@ func TestOnEmptyCalled(t *testing.T) {
 	}
 }
 
-func names(ss []*Session) []string {
-	out := make([]string, len(ss))
-	for i, s := range ss {
-		out[i] = s.Name
+// TestBroadcastKicksStalledClient proves a client that stops draining its
+// buffer is kicked instead of stalling the session's output pump.
+func TestBroadcastKicksStalledClient(t *testing.T) {
+	s := NewServer(nil)
+	sess, err := s.NewSession("noisy", longCmd, 80, 24)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return out
+	defer s.Kill("noisy")
+
+	stalled := NewClient()
+	sess.Attach(stalled, 80, 24)
+	defer sess.Detach(stalled)
+
+	// Fill the client's buffer beyond capacity without draining it.
+	for i := 0; i < cap(stalled.Out)+8; i++ {
+		sess.broadcast([]byte("x"))
+	}
+	select {
+	case <-stalled.Done():
+		// kicked, as designed
+	default:
+		t.Error("stalled client was not kicked")
+	}
+}
+
+func TestDetachClearsSwitchTarget(t *testing.T) {
+	s := NewServer(nil)
+	sess, err := s.NewSession("x", longCmd, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Kill("x")
+
+	c := NewClient()
+	sess.Attach(c, 80, 24)
+	sess.Detach(c)
+	c.Close()
+	if err := s.SwitchActive("x"); err == nil {
+		t.Error("SwitchActive should fail after the only client detached")
+	}
 }

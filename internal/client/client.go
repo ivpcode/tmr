@@ -5,6 +5,7 @@
 package client
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
@@ -52,20 +53,36 @@ func SendCmd(sockPath string, argv []string) (stdout, stderr string, code int, e
 type action struct {
 	kind    string // "detached", "exit", "switch", "closed"
 	session string // next session for "switch"
+	code    int    // session process exit code for "exit"
 	stderr  string // error text for "exit"
 }
 
 // Attach takes over the terminal and streams the given session until the user
 // detaches or the session exits. It follows `to` switches by reconnecting.
-func Attach(sockPath, session string) error {
+// The returned code is the session process's exit code when it ended while
+// attached, 0 on detach.
+func Attach(sockPath, session string) (int, error) {
 	if !term.IsTerminal(0) {
-		return fmt.Errorf("attach: stdin is not a terminal")
+		return 1, fmt.Errorf("attach: stdin is not a terminal")
 	}
 	state, err := term.MakeRaw(0)
 	if err != nil {
-		return fmt.Errorf("raw mode: %w", err)
+		return 1, fmt.Errorf("raw mode: %w", err)
 	}
 	defer state.Restore()
+
+	// Raw mode survives only as long as this process: if something kills the
+	// client (SIGTERM/SIGHUP — keyboard signals are off in raw mode), restore
+	// the terminal before dying instead of leaving the shell unusable.
+	killCh := make(chan os.Signal, 1)
+	signal.Notify(killCh, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(killCh)
+	go func() {
+		if _, ok := <-killCh; ok {
+			state.Restore()
+			os.Exit(1)
+		}
+	}()
 
 	stdinCh := make(chan []byte, 16)
 	detachCh := make(chan struct{}, 1)
@@ -88,18 +105,24 @@ func Attach(sockPath, session string) error {
 	for {
 		act, err := stream(sockPath, cur, stdinCh, detachCh, winchCh)
 		if err != nil {
-			return err
+			return 1, err
 		}
-		if act.kind == "switch" {
+		switch act.kind {
+		case "switch":
 			cur = act.session
 			continue
+		case "exit":
+			state.Restore()
+			if act.stderr != "" {
+				fmt.Fprintln(os.Stderr, "ivt: "+act.stderr)
+			}
+			return act.code, nil
+		case "closed":
+			state.Restore()
+			return 1, fmt.Errorf("server connection lost")
+		default: // detached
+			return 0, nil
 		}
-		state.Restore()
-		if act.kind == "exit" && act.stderr != "" {
-			fmt.Fprintln(os.Stderr, "ivt: "+act.stderr)
-			return fmt.Errorf("%s", act.stderr)
-		}
-		return nil
 	}
 }
 
@@ -146,7 +169,7 @@ func stream(sockPath, session string, stdinCh <-chan []byte, detachCh, winchCh <
 			case ipc.KindSwitch:
 				return action{kind: "switch", session: f.Session}, nil
 			case ipc.KindExit:
-				return action{kind: "exit", stderr: f.Stderr}, nil
+				return action{kind: "exit", code: f.Code, stderr: f.Stderr}, nil
 			}
 		case d := <-stdinCh:
 			if err := ipc.Write(conn, &ipc.Frame{Kind: ipc.KindStdin, Data: d}); err != nil {
@@ -165,15 +188,14 @@ func stream(sockPath, session string, stdinCh <-chan []byte, detachCh, winchCh <
 }
 
 // readStdin forwards stdin to stdinCh, signalling detachCh when it sees the
-// local detach key (and dropping that byte).
+// local detach key (and dropping that byte and anything after it).
 func readStdin(stdinCh chan<- []byte, detachCh chan<- struct{}) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := os.Stdin.Read(buf)
 		if n > 0 {
 			data := buf[:n]
-			if i := indexByte(data, detachKey); i >= 0 {
-				// Forward anything before the detach key, then signal.
+			if i := bytes.IndexByte(data, detachKey); i >= 0 {
 				if i > 0 {
 					send(stdinCh, data[:i])
 				}
@@ -191,17 +213,9 @@ func readStdin(stdinCh chan<- []byte, detachCh chan<- struct{}) {
 	}
 }
 
+// send delivers a copy of data (buf is reused by the reader).
 func send(ch chan<- []byte, data []byte) {
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	ch <- cp
-}
-
-func indexByte(b []byte, c byte) int {
-	for i := range b {
-		if b[i] == c {
-			return i
-		}
-	}
-	return -1
 }

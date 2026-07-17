@@ -24,6 +24,10 @@ di riduzione sono in [`docs/ANALISI.md`](docs/ANALISI.md).
 
 Per staccarsi dall'interno di una sessione si preme **`Ctrl-\`** (la sessione
 resta viva). In alternativa, da un altro terminale: `ivt detach <nome>`.
+`ivt help` mostra l'uso senza bisogno del server.
+
+Se il processo della sessione termina mentre sei attaccato, `ivt` esce con **lo
+stesso exit code** del processo — utile negli script che lanciano agenti.
 
 ## Esempi
 
@@ -43,9 +47,11 @@ ivt rename work agent   # rinomina
 ivt kill agent          # termina la sessione
 ```
 
-Il server (demone) parte da solo al primo `new`/`resume` e si spegne quando
-l'ultima sessione viene chiusa. Il socket è `$IVT_SOCK`, altrimenti
-`/tmp/ivt-<uid>/default`.
+Il server (demone) parte da solo al primo `new` e si spegne quando l'ultima
+sessione viene chiusa. Il socket è `$IVT_SOCK`, altrimenti
+`/tmp/ivt-<uid>/default`; gli eventuali messaggi diagnostici del demone
+finiscono in `server.log` accanto al socket. `kill` termina l'**intero process
+group** della sessione, quindi anche i processi figli lanciati dalla shell.
 
 ## Architettura (zero dipendenze)
 
@@ -56,7 +62,7 @@ l'ultima sessione viene chiusa. Il socket è `$IVT_SOCK`, altrimenti
 | `internal/tmux` | modello sessioni + runtime PTY + ring buffer | session.c |
 | `internal/pty` | apertura PTY e avvio processi (syscall Linux) | forkpty/openpty |
 | `internal/term` | raw mode e dimensione del terminale (syscall) | termios/terminfo |
-| `internal/ipc` | protocollo a frame su socket unix | libevent + imsg |
+| `internal/ipc` | protocollo binario a frame su socket unix | libevent + imsg |
 | `internal/command` | registry + parser + Ctx dei comandi | cmd.c + arguments.c |
 
 Nessun uso di `cgo`. L'event loop di libevent è sostituito da goroutine e
@@ -70,6 +76,13 @@ locale in raw mode e apre uno stream con il server: l'output della PTY arriva al
 tuo terminale (con replay dello scrollback recente), i tuoi tasti vanno alla
 PTY, e i cambi di dimensione (`SIGWINCH`) vengono propagati. Staccandoti, lo
 stream si chiude ma il processo continua a girare nel server.
+
+I frame sul socket sono binari — `[1 byte tipo][4 byte lunghezza][payload]` —
+con l'output del terminale trasportato **raw** (5 byte di overhead per chunk,
+una sola write per frame, ~1,1 GB/s in round-trip nel benchmark); il JSON è
+usato solo per i frame di comando/risposta. Un client che smette di leggere
+viene scollegato d'ufficio invece di bloccare l'output della sessione per gli
+altri; al riattacco il ring buffer ripristina lo schermo recente.
 
 ## Il sistema di comandi (semplificazione rispetto a tmux)
 

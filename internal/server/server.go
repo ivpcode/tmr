@@ -119,7 +119,9 @@ func (s *Server) handleAttach(conn net.Conn, f *ipc.Frame) {
 	defer client.Close()
 	defer sess.Detach(client)
 
-	// Writer: pty output and control messages -> client.
+	// Writer: pty output and control messages -> client. Every control message
+	// ends the attach, so after relaying one it closes the connection to
+	// unblock the reader below.
 	go func() {
 		for {
 			select {
@@ -130,10 +132,8 @@ func (s *Server) handleAttach(conn net.Conn, f *ipc.Frame) {
 				}
 			case m := <-client.Ctrl:
 				ipc.Write(conn, ctrlToFrame(m))
-				if m.Kind == "detached" || m.Kind == "exit" || m.Kind == "switch" {
-					conn.Close() // unblock the reader; the attach is over
-					return
-				}
+				conn.Close()
+				return
 			case <-client.Done():
 				return
 			}
@@ -159,9 +159,9 @@ func (s *Server) handleAttach(conn net.Conn, f *ipc.Frame) {
 
 func ctrlToFrame(m tmux.Control) *ipc.Frame {
 	switch m.Kind {
-	case "switch":
+	case tmux.CtrlSwitch:
 		return &ipc.Frame{Kind: ipc.KindSwitch, Session: m.Session}
-	case "exit":
+	case tmux.CtrlExit:
 		return &ipc.Frame{Kind: ipc.KindExit, Code: m.Code}
 	default:
 		return &ipc.Frame{Kind: ipc.KindDetached}

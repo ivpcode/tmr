@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 
 	"github.com/ivpcode/tmr/internal/tmux"
 )
@@ -113,8 +114,8 @@ func (c *Ctx) Int(name string, def int) int {
 	if !ok {
 		return def
 	}
-	n := def
-	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
+	n, err := strconv.Atoi(v)
+	if err != nil {
 		return def
 	}
 	return n

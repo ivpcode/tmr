@@ -1,6 +1,6 @@
 # Binaries
+/ivt
 /tmr
-/tmr-bin
 *.exe
 
 # Test/coverage output

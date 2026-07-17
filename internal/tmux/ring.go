@@ -14,13 +14,13 @@ func newRing(size int) *ring {
 
 // Write appends p, discarding the oldest bytes once capacity is exceeded.
 func (r *ring) Write(p []byte) {
-	cap := len(r.buf)
-	if cap == 0 {
+	size := len(r.buf)
+	if size == 0 {
 		return
 	}
 	// If p is larger than the whole ring, keep only its tail.
-	if len(p) >= cap {
-		copy(r.buf, p[len(p)-cap:])
+	if len(p) >= size {
+		copy(r.buf, p[len(p)-size:])
 		r.pos = 0
 		r.full = true
 		return
@@ -31,7 +31,7 @@ func (r *ring) Write(p []byte) {
 		copy(r.buf, p[n:])
 		r.full = true
 	}
-	r.pos = (r.pos + len(p)) % cap
+	r.pos = (r.pos + len(p)) % size
 	if r.pos == 0 {
 		r.full = true
 	}

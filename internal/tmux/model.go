@@ -7,6 +7,7 @@ package tmux
 import (
 	"fmt"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ivpcode/tmr/internal/pty"
@@ -15,11 +16,20 @@ import (
 // ringSize is how much recent pty output is retained to replay on attach.
 const ringSize = 256 << 10 // 256 KiB
 
+// CtrlKind identifies an out-of-band control message.
+type CtrlKind int
+
+const (
+	CtrlDetached CtrlKind = iota // the client must detach
+	CtrlSwitch                   // the client must re-attach to Control.Session
+	CtrlExit                     // the session process exited with Control.Code
+)
+
 // Control is an out-of-band message sent to an attached client.
 type Control struct {
-	Kind    string // "detached", "switch", "exit"
-	Session string // target session for "switch"
-	Code    int    // process exit code for "exit"
+	Kind    CtrlKind
+	Session string // target session for CtrlSwitch
+	Code    int    // process exit code for CtrlExit
 }
 
 // Client is a server-side view of one attached client (a running `resume`).
@@ -27,6 +37,7 @@ type Client struct {
 	Out  chan []byte  // pty output destined for this client
 	Ctrl chan Control // out-of-band control messages
 	done chan struct{}
+	once sync.Once
 }
 
 // NewClient makes a client with reasonable buffering.
@@ -38,11 +49,21 @@ func NewClient() *Client {
 	}
 }
 
-// Close marks the client finished so broadcasts skip it.
-func (c *Client) Close() { close(c.done) }
+// Close marks the client finished so broadcasts skip it. It is safe to call
+// from multiple goroutines (the connection handler and a kicking broadcast).
+func (c *Client) Close() { c.once.Do(func() { close(c.done) }) }
 
-// Done is closed when the client is finished; server writers select on it.
+// Done is closed when the client is finished; senders select on it.
 func (c *Client) Done() <-chan struct{} { return c.done }
+
+// SessionInfo is an immutable snapshot of a session for listing, safe to read
+// without further locking.
+type SessionInfo struct {
+	Name     string
+	Cmd      []string
+	Created  time.Time
+	Attached int
+}
 
 // Server owns all sessions.
 type Server struct {
@@ -56,20 +77,19 @@ type Server struct {
 	Created time.Time
 }
 
-// Session is one named process running in a pty.
+// Session is one named process running in a pty. Cmd and Created are immutable
+// after creation; name is guarded by the server mutex (see Name).
 type Session struct {
-	Name    string
 	Cmd     []string
 	Created time.Time
 
+	name string // guarded by srv.mu (Rename mutates it)
 	srv  *Server
 	proc *pty.Process
 
-	mu       sync.Mutex
-	ring     *ring
-	clients  map[*Client]struct{}
-	exited   bool
-	exitCode int
+	mu      sync.Mutex
+	ring    *ring
+	clients map[*Client]struct{}
 }
 
 // NewServer returns an empty server. onEmpty (may be nil) is called once the
@@ -106,9 +126,9 @@ func (s *Server) NewSession(name string, cmd []string, cols, rows uint16) (*Sess
 	}
 
 	sess := &Session{
-		Name:    name,
 		Cmd:     cmd,
 		Created: time.Now(),
+		name:    name,
 		srv:     s,
 		proc:    proc,
 		ring:    newRing(ringSize),
@@ -121,7 +141,15 @@ func (s *Server) NewSession(name string, cmd []string, cols, rows uint16) (*Sess
 	return sess, nil
 }
 
-// Kill terminates a session's process and removes it.
+// Name returns the session's current name.
+func (sess *Session) Name() string {
+	sess.srv.mu.Lock()
+	defer sess.srv.mu.Unlock()
+	return sess.name
+}
+
+// Kill terminates a session's process (and its whole process group, so shells
+// take their children with them) and removes it.
 func (s *Server) Kill(name string) error {
 	s.mu.Lock()
 	sess := s.sessions[name]
@@ -129,8 +157,13 @@ func (s *Server) Kill(name string) error {
 	if sess == nil {
 		return fmt.Errorf("session not found: %s", name)
 	}
-	sess.proc.Proc.Kill()
-	// pump() will observe the exit and call remove().
+	// The child is a session leader (Setsid), so its pid is also its process
+	// group: signal the group to kill descendants too.
+	pid := sess.proc.Proc.Pid
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		sess.proc.Proc.Kill()
+	}
+	// pump() observes the exit and removes the session.
 	return nil
 }
 
@@ -147,7 +180,7 @@ func (s *Server) Rename(oldName, newName string) error {
 	}
 	delete(s.sessions, oldName)
 	s.sessions[newName] = sess
-	sess.Name = newName
+	sess.name = newName
 	for i, n := range s.order {
 		if n == oldName {
 			s.order[i] = newName
@@ -157,13 +190,19 @@ func (s *Server) Rename(oldName, newName string) error {
 	return nil
 }
 
-// List returns sessions in creation order.
-func (s *Server) List() []*Session {
+// List returns a snapshot of all sessions in creation order.
+func (s *Server) List() []SessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]*Session, 0, len(s.order))
+	out := make([]SessionInfo, 0, len(s.order))
 	for _, n := range s.order {
-		out = append(out, s.sessions[n])
+		sess := s.sessions[n]
+		out = append(out, SessionInfo{
+			Name:     n,
+			Cmd:      sess.Cmd,
+			Created:  sess.Created,
+			Attached: sess.Attached(),
+		})
 	}
 	return out
 }
@@ -185,8 +224,11 @@ func (s *Server) uniqueNameLocked() string {
 	}
 }
 
-func (s *Server) remove(name string) {
+// remove deletes the session from the server, reading its (possibly renamed)
+// name under the server lock, and fires onEmpty if it was the last one.
+func (s *Server) remove(sess *Session) {
 	s.mu.Lock()
+	name := sess.name
 	delete(s.sessions, name)
 	for i, n := range s.order {
 		if n == name {
@@ -210,13 +252,12 @@ func (s *Server) DetachClients(name string) error {
 	if sess == nil {
 		return fmt.Errorf("session not found: %s", name)
 	}
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	if len(sess.clients) == 0 {
+	clients := sess.clientList()
+	if len(clients) == 0 {
 		return fmt.Errorf("session %s has no attached client", name)
 	}
-	for c := range sess.clients {
-		sendCtrl(c, Control{Kind: "detached"})
+	for _, c := range clients {
+		sendCtrl(c, Control{Kind: CtrlDetached})
 	}
 	return nil
 }
@@ -233,7 +274,12 @@ func (s *Server) SwitchActive(name string) error {
 	if c == nil {
 		return fmt.Errorf("no attached client to switch")
 	}
-	sendCtrl(c, Control{Kind: "switch", Session: name})
+	select {
+	case <-c.Done():
+		return fmt.Errorf("no attached client to switch")
+	default:
+	}
+	sendCtrl(c, Control{Kind: CtrlSwitch, Session: name})
 	return nil
 }
 
@@ -257,11 +303,17 @@ func (sess *Session) Attach(c *Client, cols, rows uint16) {
 	}
 }
 
-// Detach unregisters c from the session.
+// Detach unregisters c from the session and drops it as the `to` target.
 func (sess *Session) Detach(c *Client) {
 	sess.mu.Lock()
 	delete(sess.clients, c)
 	sess.mu.Unlock()
+
+	sess.srv.mu.Lock()
+	if sess.srv.last == c {
+		sess.srv.last = nil
+	}
+	sess.srv.mu.Unlock()
 }
 
 // WriteInput forwards client keystrokes to the pty.
@@ -281,6 +333,16 @@ func (sess *Session) Attached() int {
 	return len(sess.clients)
 }
 
+func (sess *Session) clientList() []*Client {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	out := make([]*Client, 0, len(sess.clients))
+	for c := range sess.clients {
+		out = append(out, c)
+	}
+	return out
+}
+
 // pump reads pty output, feeds the ring buffer and broadcasts to clients until
 // the process exits, then notifies clients and removes the session.
 func (sess *Session) pump() {
@@ -298,24 +360,16 @@ func (sess *Session) pump() {
 	}
 
 	code := waitCode(sess.proc.Wait())
-
-	sess.mu.Lock()
-	sess.exited = true
-	sess.exitCode = code
-	clients := make([]*Client, 0, len(sess.clients))
-	for c := range sess.clients {
-		clients = append(clients, c)
+	for _, c := range sess.clientList() {
+		sendCtrl(c, Control{Kind: CtrlExit, Code: code})
 	}
-	sess.mu.Unlock()
-
-	for _, c := range clients {
-		sendCtrl(c, Control{Kind: "exit", Code: code})
-	}
-	sess.srv.remove(sess.Name)
+	sess.srv.remove(sess)
 	sess.proc.Master.Close()
 }
 
 // broadcast stores a chunk in the ring and sends a copy to every live client.
+// A client whose buffer is full (~16 MiB of undelivered output) is stalled or
+// dead: it gets kicked instead of stalling the whole session's output.
 func (sess *Session) broadcast(chunk []byte) {
 	sess.mu.Lock()
 	sess.ring.Write(chunk)
@@ -329,14 +383,19 @@ func (sess *Session) broadcast(chunk []byte) {
 		select {
 		case c.Out <- chunk:
 		case <-c.done:
+		default:
+			c.Close()
 		}
 	}
 }
 
-// sendCtrl delivers a control message without blocking on a dead client.
+// sendCtrl delivers a control message without ever blocking: a client that
+// cannot take a control message is stalled and gets kicked.
 func sendCtrl(c *Client, m Control) {
 	select {
 	case c.Ctrl <- m:
 	case <-c.done:
+	default:
+		c.Close()
 	}
 }

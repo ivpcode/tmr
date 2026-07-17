@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // loginShell returns the user's shell, falling back to /bin/sh.
@@ -20,7 +21,7 @@ func childEnv() []string {
 	env := os.Environ()
 	out := env[:0]
 	for _, e := range env {
-		if len(e) >= 5 && e[:5] == "TERM=" {
+		if strings.HasPrefix(e, "TERM=") {
 			continue
 		}
 		out = append(out, e)

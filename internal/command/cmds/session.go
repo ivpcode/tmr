@@ -5,6 +5,7 @@ package cmds
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ivpcode/tmr/internal/command"
@@ -38,7 +39,7 @@ var newSession = &command.Command{
 		if err != nil {
 			return c.Errorf("%v", err)
 		}
-		c.Printf("%s\n", sess.Name) // just the name: the client reads it to attach
+		c.Printf("%s\n", sess.Name()) // just the name: the client reads it to attach
 		return nil
 	},
 }
@@ -48,13 +49,9 @@ var lsSessions = &command.Command{
 	Name:    "ls",
 	Summary: "list sessions",
 	Run: func(c *command.Ctx) error {
-		sessions := c.Server.List()
-		if len(sessions) == 0 {
-			return nil
-		}
-		for _, s := range sessions {
+		for _, s := range c.Server.List() {
 			mark := ""
-			if s.Attached() > 0 {
+			if s.Attached > 0 {
 				mark = " (attached)"
 			}
 			c.Printf("%s: %s  [%s]%s\n",
@@ -131,11 +128,7 @@ func cmdline(cmd []string) string {
 	if len(cmd) == 0 {
 		return "(shell)"
 	}
-	out := cmd[0]
-	for _, a := range cmd[1:] {
-		out += " " + a
-	}
-	return out
+	return strings.Join(cmd, " ")
 }
 
 // age renders a short human duration since t.
