@@ -1,67 +1,92 @@
-# tmr — un clone di tmux in Go, senza dipendenze
+# ivt — multiplexer di sessioni per agenti, in Go e senza dipendenze
 
-`tmr` è una reimplementazione **ridotta** e **senza dipendenze esterne** (solo
-la standard library di Go) del multiplexer di terminale [tmux](https://github.com/tmux/tmux).
+`ivt` è un multiplexer di terminale ispirato a [tmux](https://github.com/tmux/tmux),
+ridotto all'osso e **senza dipendenze esterne** (solo la standard library di Go).
+Serve un caso d'uso preciso: lanciare e riprendere **agenti a lunga durata** (come
+Claude Code) in sessioni che restano vive anche quando ti stacchi dal terminale.
 
-L'obiettivo non è la parità 1:1 con tmux (~103.000 righe di C), ma un clone
-moderno e mantenibile: ~12–15k righe, un solo terminale target (ANSI /
-xterm-256color) e un sistema di comandi semplificato.
+Rispetto a tmux (~103.000 righe di C, 92 comandi, dipendente da libevent +
+ncurses/terminfo), `ivt` tiene **solo le sessioni**: niente finestre, pane,
+copy-mode, hook o modi interattivi. L'analisi del sorgente originale e il piano
+di riduzione sono in [`docs/ANALISI.md`](docs/ANALISI.md).
 
-L'analisi completa del sorgente originale e il piano di riduzione sono in
-[`docs/ANALISI.md`](docs/ANALISI.md).
+## Comandi
 
-## Stato attuale: scheletro architetturale
+| Comando | Alias | Argomenti | Descrizione |
+|---|---|---|---|
+| `new` | `n` | `[nome] [comando [args...]]` | Crea una sessione e vi si attacca. Senza nome ne genera uno progressivo; senza comando avvia la shell. |
+| `resume` | `r` | `<nome>` | Si attacca a una sessione esistente. |
+| `detach` | `d` | `<nome>` | Stacca i client da una sessione (da un altro terminale). |
+| `kill` | | `<nome>` | Distrugge una sessione e il suo processo. |
+| `ls` | | | Elenca le sessioni. |
+| `rename` | `rn` | `<vecchio> <nuovo>` | Rinomina una sessione. |
+| `to` | | `<nome>` | Sposta il client attivo su un'altra sessione. |
 
-Questo commit contiene lo **scheletro** funzionante end-to-end:
+Per staccarsi dall'interno di una sessione si preme **`Ctrl-\`** (la sessione
+resta viva). In alternativa, da un altro terminale: `ivt detach <nome>`.
 
-- **Client/server** su socket unix (`internal/server`, `internal/client`)
-- **IPC** con framing length-prefixed JSON, al posto di `imsg` (`internal/ipc`)
-- **Modello dati** session → window → pane (`internal/tmux`)
-- **Sistema di comandi semplificato** (`internal/command`) — vedi sotto
-- **Risoluzione target** `-t` in ~150 righe, al posto delle 1.300 di `cmd-find.c`
-- Avvio automatico del server in background dal client
-- Comandi dimostrativi: `new-session`, `kill-session`, `list-sessions`,
-  `has-session`, `list-windows`, `list-panes`, `kill-server`, `list-commands`
+## Esempi
 
-Non ancora presenti (prossime fasi): PTY + shell reale, parser ANSI, rendering,
-status bar, attach interattivo, copy-mode.
+```sh
+go build -o ivt ./cmd/ivt
+
+ivt n work claude       # crea la sessione "work" che esegue "claude" e vi si attacca
+# ... lavori con l'agente ...
+# premi Ctrl-\ per staccarti; claude continua a girare
+
+ivt ls                  # work: claude  [5m]
+ivt r work              # ti riattacchi (rivedi lo scrollback recente)
+
+ivt n build             # nuova sessione con la shell
+ivt to work             # sposta il client attivo sulla sessione "work"
+ivt rename work agent   # rinomina
+ivt kill agent          # termina la sessione
+```
+
+Il server (demone) parte da solo al primo `new`/`resume` e si spegne quando
+l'ultima sessione viene chiusa. Il socket è `$IVT_SOCK`, altrimenti
+`/tmp/ivt-<uid>/default`.
+
+## Architettura (zero dipendenze)
+
+| Package | Ruolo | Cosa sostituisce di tmux |
+|---|---|---|
+| `internal/server` | demone: possiede lo stato e serve i client | server-client.c |
+| `internal/client` | comandi one-shot + attach interattivo (raw mode) | client.c |
+| `internal/tmux` | modello sessioni + runtime PTY + ring buffer | session.c |
+| `internal/pty` | apertura PTY e avvio processi (syscall Linux) | forkpty/openpty |
+| `internal/term` | raw mode e dimensione del terminale (syscall) | termios/terminfo |
+| `internal/ipc` | protocollo a frame su socket unix | libevent + imsg |
+| `internal/command` | registry + parser + Ctx dei comandi | cmd.c + arguments.c |
+
+Nessun uso di `cgo`. L'event loop di libevent è sostituito da goroutine e
+channel; terminfo da un profilo terminale fisso (`xterm-256color`).
+
+## Come funziona l'attach
+
+Il server tiene aperta la PTY di ogni sessione e ne bufferizza l'output in un
+ring buffer. Quando ti attacchi (`resume`/`new`), il client mette il terminale
+locale in raw mode e apre uno stream con il server: l'output della PTY arriva al
+tuo terminale (con replay dello scrollback recente), i tuoi tasti vanno alla
+PTY, e i cambi di dimensione (`SIGWINCH`) vengono propagati. Staccandoti, lo
+stream si chiude ma il processo continua a girare nel server.
 
 ## Il sistema di comandi (semplificazione rispetto a tmux)
 
-In tmux ogni comando è un file separato e la spec degli argomenti è una stringa
-getopt criptica (`"af:t:"`). In `tmr` un comando è una struct dichiarativa,
-i comandi correlati stanno nello stesso file, e un unico dispatcher gestisce
-parsing, risoluzione target, generazione dell'usage ed esecuzione.
+In tmux ogni comando è un file separato con la spec argomenti in una stringa
+getopt criptica (`"af:t:"`). In `ivt` un comando è una struct dichiarativa;
+i comandi sono posizionali e raggruppati in un unico file:
 
 ```go
 var killSession = &command.Command{
-    Name:    "kill-session",
+    Name:    "kill",
     Summary: "destroy a session",
-    Flags: command.Flags{
-        "t": command.Target(tmux.KindSession), // -t risolto in automatico
-    },
+    MinArgs: 1, MaxArgs: 1,
     Run: func(c *command.Ctx) error {
-        return c.Server.KillSession(c.Target.Session.Name)
+        return c.Server.Kill(c.Args[0])
     },
 }
 ```
-
-- Spec dei flag **leggibile**: `"a": Bool(...)`, `"s": Str(...)`, `"t": Target(...)`.
-- **Nessun boilerplate**: `Run(c *Ctx)` riceve già flag, target e server.
-- **Usage generato** automaticamente dalla spec (niente stringhe da mantenere a mano).
-
-## Uso
-
-```sh
-go build -o tmr ./cmd/tmr
-
-./tmr new-session -d -s work    # crea una sessione (il server parte da solo)
-./tmr list-sessions
-./tmr list-windows -t work
-./tmr kill-server
-```
-
-Il socket è `$TMR_SOCK` oppure `/tmp/tmr-<uid>/default`.
 
 ## Sviluppo
 
@@ -71,15 +96,4 @@ go test ./...
 go vet ./...
 ```
 
-## Layout dei package
-
-```
-cmd/tmr/            entrypoint (client o server)
-internal/command/   sistema comandi: registry, parser, usage, Ctx
-internal/command/cmds/  comandi built-in raggruppati per tema
-internal/tmux/      modello dati + risoluzione target
-internal/ipc/       protocollo client/server (socket unix)
-internal/server/    demone
-internal/client/    invio comandi al demone
-docs/ANALISI.md     analisi di tmux e piano di riduzione
-```
+Solo Linux (usa PTY e termios via `syscall`).

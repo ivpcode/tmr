@@ -74,28 +74,5 @@ func (cmd *Command) parse(srv *tmux.Server, argv []string, out, errw io.Writer) 
 	if cmd.MaxArgs >= 0 && len(c.Args) > cmd.MaxArgs {
 		return nil, fmt.Errorf("too many arguments (max %d)", cmd.MaxArgs)
 	}
-
-	if err := c.resolveTarget(); err != nil {
-		return nil, err
-	}
 	return c, nil
-}
-
-// resolveTarget finds the single Target flag (if any) and resolves its value
-// against the server, filling c.Target. When the flag is absent it falls back
-// to the current/most-recent object of the requested kind.
-func (c *Ctx) resolveTarget() error {
-	for name, spec := range c.Cmd.Flags {
-		if spec.Type != FlagTarget {
-			continue
-		}
-		val, given := c.vals[name]
-		t, err := c.Server.ResolveTarget(spec.Target, val, given)
-		if err != nil {
-			return err
-		}
-		c.Target = t
-		return nil // at most one target flag per command
-	}
-	return nil
 }

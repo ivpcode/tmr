@@ -3,8 +3,6 @@ package command
 import (
 	"sort"
 	"strings"
-
-	"github.com/ivpcode/tmr/internal/tmux"
 )
 
 // Usage builds a usage string from the structured Flags spec, so no command has
@@ -43,18 +41,6 @@ func argName(f Flag) string {
 	switch f.Type {
 	case FlagInt:
 		return "n"
-	case FlagTarget:
-		switch f.Target {
-		case tmux.KindSession:
-			return "session"
-		case tmux.KindWindow:
-			return "window"
-		case tmux.KindPane:
-			return "pane"
-		case tmux.KindClient:
-			return "client"
-		}
-		return "target"
 	default:
 		return "value"
 	}

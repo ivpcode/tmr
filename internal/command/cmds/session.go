@@ -1,89 +1,152 @@
-// Package cmds holds the built-in tmr commands. Related commands are grouped by
-// theme in one file (session.go, window.go, server.go) instead of tmux's
-// one-file-per-command layout. Importing this package for its side effects
-// registers every command.
+// Package cmds holds the built-in ivt commands that run on the server: they
+// change session state and return text. The interactive commands (resume, to)
+// live in the client, since they take over the terminal.
 package cmds
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/ivpcode/tmr/internal/command"
-	"github.com/ivpcode/tmr/internal/tmux"
 )
 
-// new-session [-d] [-s name]
+// new [name] [command [args...]]
+//
+// Creates a session. With no name one is generated. With a command, the session
+// runs it; otherwise it runs the login shell. The session name is printed so
+// the client can attach to it.
 var newSession = &command.Command{
-	Name:    "new-session",
-	Alias:   "new",
-	Summary: "create a new session",
-	Flags: command.Flags{
-		"d": command.Bool("do not attach to the new session"),
-		"s": command.Str("session name"),
-	},
+	Name:    "new",
+	Alias:   "n",
+	Summary: "create a session (optionally running a command)",
 	MinArgs: 0,
-	MaxArgs: 0,
+	MaxArgs: -1,
 	Run: func(c *command.Ctx) error {
-		sess, err := c.Server.NewSession(c.Flag("s"))
+		name := ""
+		var cmd []string
+		if len(c.Args) >= 1 {
+			name = c.Args[0]
+		}
+		if len(c.Args) >= 2 {
+			cmd = c.Args[1:]
+		}
+		cols, rows := c.Cols, c.Rows
+		if cols == 0 {
+			cols, rows = 80, 24
+		}
+		sess, err := c.Server.NewSession(name, cmd, cols, rows)
 		if err != nil {
 			return c.Errorf("%v", err)
 		}
-		// Without -d a real client would attach here; that lands with the
-		// rendering layer. For now we acknowledge creation.
-		if c.Bool("d") {
-			c.Printf("%s\n", sess.Name)
-		} else {
-			c.Printf("created session %s (attach not yet implemented)\n", sess.Name)
+		c.Printf("%s\n", sess.Name) // just the name: the client reads it to attach
+		return nil
+	},
+}
+
+// ls — list sessions
+var lsSessions = &command.Command{
+	Name:    "ls",
+	Summary: "list sessions",
+	Run: func(c *command.Ctx) error {
+		sessions := c.Server.List()
+		if len(sessions) == 0 {
+			return nil
+		}
+		for _, s := range sessions {
+			mark := ""
+			if s.Attached() > 0 {
+				mark = " (attached)"
+			}
+			c.Printf("%s: %s  [%s]%s\n",
+				s.Name, cmdline(s.Cmd), age(s.Created), mark)
 		}
 		return nil
 	},
 }
 
-// kill-session -t session
+// kill <name> — destroy a session
 var killSession = &command.Command{
-	Name:    "kill-session",
+	Name:    "kill",
 	Summary: "destroy a session",
-	Flags: command.Flags{
-		"t": command.Target(tmux.KindSession),
-	},
+	MinArgs: 1,
+	MaxArgs: 1,
 	Run: func(c *command.Ctx) error {
-		if c.Target == nil || c.Target.Session == nil {
-			return c.Errorf("no target session")
-		}
-		name := c.Target.Session.Name
-		if err := c.Server.KillSession(name); err != nil {
+		if err := c.Server.Kill(c.Args[0]); err != nil {
 			return c.Errorf("%v", err)
 		}
 		return nil
 	},
 }
 
-// list-sessions
-var listSessions = &command.Command{
-	Name:    "list-sessions",
-	Alias:   "ls",
-	Summary: "list sessions",
+// rename <old> <new> — rename a session
+var renameSession = &command.Command{
+	Name:    "rename",
+	Alias:   "rn",
+	Summary: "rename a session",
+	MinArgs: 2,
+	MaxArgs: 2,
 	Run: func(c *command.Ctx) error {
-		for _, s := range c.Server.SessionList() {
-			c.Printf("%s: %d windows\n", s.Name, len(s.Windows))
+		if err := c.Server.Rename(c.Args[0], c.Args[1]); err != nil {
+			return c.Errorf("%v", err)
 		}
 		return nil
 	},
 }
 
-// has-session -t session
-var hasSession = &command.Command{
-	Name:    "has-session",
-	Alias:   "has",
-	Summary: "check a session exists",
-	Flags: command.Flags{
-		"t": command.Target(tmux.KindSession),
-	},
+// detach <name> — detach clients from a session
+var detachSession = &command.Command{
+	Name:    "detach",
+	Alias:   "d",
+	Summary: "detach clients from a session",
+	MinArgs: 1,
+	MaxArgs: 1,
 	Run: func(c *command.Ctx) error {
-		if c.Target == nil || c.Target.Session == nil {
-			return c.Errorf("no such session")
+		if err := c.Server.DetachClients(c.Args[0]); err != nil {
+			return c.Errorf("%v", err)
+		}
+		return nil
+	},
+}
+
+// to <name> — switch the active client to another session
+var toSession = &command.Command{
+	Name:    "to",
+	Summary: "switch the active client to another session",
+	MinArgs: 1,
+	MaxArgs: 1,
+	Run: func(c *command.Ctx) error {
+		if err := c.Server.SwitchActive(c.Args[0]); err != nil {
+			return c.Errorf("%v", err)
 		}
 		return nil
 	},
 }
 
 func init() {
-	command.Register(newSession, killSession, listSessions, hasSession)
+	command.Register(newSession, lsSessions, killSession, renameSession, detachSession, toSession)
+}
+
+// cmdline renders a session's command for listing.
+func cmdline(cmd []string) string {
+	if len(cmd) == 0 {
+		return "(shell)"
+	}
+	out := cmd[0]
+	for _, a := range cmd[1:] {
+		out += " " + a
+	}
+	return out
+}
+
+// age renders a short human duration since t.
+func age(t time.Time) string {
+	d := time.Since(t).Round(time.Second)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
 }

@@ -1,102 +1,114 @@
 package tmux
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
-func setup(t *testing.T) *Server {
+// longCmd is a harmless process that stays alive reading its pty.
+var longCmd = []string{"sleep", "60"}
+
+func waitGone(t *testing.T, s *Server, name string) {
 	t.Helper()
-	s := NewServer()
-	if _, err := s.NewSession("work"); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 200; i++ {
+		if s.Get(name) == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := s.NewSession("dev"); err != nil {
-		t.Fatal(err)
-	}
-	return s
+	t.Fatalf("session %q was not removed", name)
 }
 
 func TestNewSessionAutoName(t *testing.T) {
-	s := NewServer()
-	sess, err := s.NewSession("")
+	s := NewServer(nil)
+	sess, err := s.NewSession("", longCmd, 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Kill(sess.Name)
 	if sess.Name != "0" {
 		t.Errorf("auto name = %q, want 0", sess.Name)
-	}
-	if len(sess.Windows) != 1 || len(sess.Windows[0].Panes) != 1 {
-		t.Errorf("new session should have 1 window with 1 pane")
 	}
 }
 
 func TestNewSessionDuplicate(t *testing.T) {
-	s := setup(t)
-	if _, err := s.NewSession("work"); err == nil {
+	s := NewServer(nil)
+	sess, err := s.NewSession("work", longCmd, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Kill(sess.Name)
+	if _, err := s.NewSession("work", longCmd, 80, 24); err == nil {
 		t.Error("expected duplicate session error")
 	}
 }
 
-func TestResolveSession(t *testing.T) {
-	s := setup(t)
-	tg, err := s.ResolveTarget(KindSession, "work", true)
-	if err != nil {
-		t.Fatal(err)
+func TestListOrder(t *testing.T) {
+	s := NewServer(nil)
+	for _, n := range []string{"a", "b", "c"} {
+		if _, err := s.NewSession(n, longCmd, 80, 24); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Kill(n)
 	}
-	if tg.Session.Name != "work" {
-		t.Errorf("got session %q, want work", tg.Session.Name)
-	}
-}
-
-func TestResolveMissingSession(t *testing.T) {
-	s := setup(t)
-	if _, err := s.ResolveTarget(KindSession, "nope", true); err == nil {
-		t.Error("expected error resolving missing session")
+	got := s.List()
+	if len(got) != 3 || got[0].Name != "a" || got[1].Name != "b" || got[2].Name != "c" {
+		t.Errorf("list order wrong: %v", names(got))
 	}
 }
 
-func TestResolveWindowFromSessionName(t *testing.T) {
-	// -t work with a window kind should default to work's current window.
-	s := setup(t)
-	tg, err := s.ResolveTarget(KindWindow, "work", true)
-	if err != nil {
+func TestRename(t *testing.T) {
+	s := NewServer(nil)
+	if _, err := s.NewSession("old", longCmd, 80, 24); err != nil {
 		t.Fatal(err)
 	}
-	if tg.Session.Name != "work" || tg.Window == nil {
-		t.Errorf("window target = %+v, want work + current window", tg)
+	if err := s.Rename("old", "new"); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Kill("new")
+	if s.Get("old") != nil {
+		t.Error("old name still present")
+	}
+	if s.Get("new") == nil {
+		t.Error("new name missing")
+	}
+	if err := s.Rename("missing", "x"); err == nil {
+		t.Error("expected error renaming missing session")
 	}
 }
 
-func TestResolvePaneExplicit(t *testing.T) {
-	s := setup(t)
-	tg, err := s.ResolveTarget(KindPane, "work:0.0", true)
-	if err != nil {
+func TestKillRemoves(t *testing.T) {
+	s := NewServer(nil)
+	if _, err := s.NewSession("work", longCmd, 80, 24); err != nil {
 		t.Fatal(err)
 	}
-	if tg.Pane == nil || tg.Pane.ID != tg.Window.Panes[0].ID {
-		t.Errorf("pane target = %+v", tg)
+	if err := s.Kill("work"); err != nil {
+		t.Fatal(err)
+	}
+	waitGone(t, s, "work")
+	if err := s.Kill("work"); err == nil {
+		t.Error("expected error killing removed session")
 	}
 }
 
-func TestResolveDefaultCurrent(t *testing.T) {
-	// No target given -> current session (most recent).
-	s := setup(t)
-	tg, err := s.ResolveTarget(KindSession, "", false)
-	if err != nil {
+func TestOnEmptyCalled(t *testing.T) {
+	done := make(chan struct{}, 1)
+	s := NewServer(func() { done <- struct{}{} })
+	if _, err := s.NewSession("only", longCmd, 80, 24); err != nil {
 		t.Fatal(err)
 	}
-	if tg.Session.Name != "dev" {
-		t.Errorf("current session = %q, want dev", tg.Session.Name)
+	s.Kill("only")
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Error("onEmpty was not called after last session died")
 	}
 }
 
-func TestKillSession(t *testing.T) {
-	s := setup(t)
-	if err := s.KillSession("work"); err != nil {
-		t.Fatal(err)
+func names(ss []*Session) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = s.Name
 	}
-	if len(s.SessionList()) != 1 {
-		t.Errorf("expected 1 session after kill, got %d", len(s.SessionList()))
-	}
-	if err := s.KillSession("work"); err == nil {
-		t.Error("expected error killing already-removed session")
-	}
+	return out
 }

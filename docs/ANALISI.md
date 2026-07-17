@@ -167,39 +167,48 @@ Vantaggi:
 - **File raggruppati per tema** (`kill.go`, `window.go`, `session.go`, `options.go`) invece di 63 file.
 - **Un solo dispatcher** con validazione flag + usage generata automaticamente.
 
-## 6. Scope MVP proposto per il primo clone funzionante
+## 6. Scope finale: `ivt`, solo sessioni per agenti
 
-**Comandi (Tier 1 — ~20):**
-`new-session`, `attach-session`, `detach-client`, `kill-session`,
-`kill-server`, `list-sessions`, `new-window`, `kill-window`, `list-windows`,
-`next-window`, `previous-window`, `rename-window`, `select-window`,
-`split-window`, `select-pane`, `kill-pane`, `list-panes`, `resize-pane`,
-`send-keys`, `set-option` (ridotto), `bind-key`/`unbind-key`, `source-file`.
+Dopo l'analisi, lo scope è stato ristretto a un caso d'uso preciso: **lanciare e
+riprendere agenti a lunga durata** (es. Claude Code). Il clone si chiama `ivt` e
+tiene **solo la gestione delle sessioni**. Finestre, pane, layout, copy-mode,
+modi interattivi, hook, control mode, format language e la quasi totalità delle
+opzioni sono **tagliati**.
 
-**Funzionalità:** server/client su socket unix, sessioni/finestre/pane,
-split orizzontale/verticale, PTY con shell, parser ANSI, status bar minima,
-prefix key + binding essenziali, detach/attach.
+**Comandi (7, ad argomenti posizionali):**
 
-**Fuori dal MVP (fase 2+):** copy-mode, choose-tree e modi interattivi,
-control mode, hooks, format language completo, la maggior parte delle opzioni,
-layout predefiniti.
+| Comando | Alias | Argomenti | Descrizione |
+|---|---|---|---|
+| `new` | `n` | `[nome] [comando [args...]]` | Crea una sessione e vi si attacca |
+| `resume` | `r` | `<nome>` | Si attacca a una sessione esistente |
+| `detach` | `d` | `<nome>` | Stacca i client da una sessione |
+| `kill` | | `<nome>` | Distrugge una sessione |
+| `ls` | | | Elenca le sessioni |
+| `rename` | `rn` | `<vecchio> <nuovo>` | Rinomina una sessione |
+| `to` | | `<nome>` | Sposta il client attivo su un'altra sessione |
 
-## 7. Struttura package Go proposta
+**Funzionalità:** server/client su socket unix, sessioni con un processo reale in
+PTY che sopravvive al detach, ring buffer per il replay dello scrollback,
+attach interattivo in raw mode, resize (SIGWINCH), detach con `Ctrl-\`,
+auto-avvio e auto-spegnimento del server.
+
+## 7. Struttura package Go (implementata)
 
 ```
-tmr/
-├── cmd/tmr/main.go        # entrypoint: client o server
+tmr/                        (modulo github.com/ivpcode/tmr, binario "ivt")
+├── cmd/ivt/main.go         # entrypoint: client o server, dispatch comandi
 ├── internal/
-│   ├── server/            # demone, event loop (goroutine), stato globale
-│   ├── client/            # attach: input tastiera + draw
-│   ├── ipc/               # socket unix + framing messaggi
-│   ├── tmux/              # modello: session, window, pane
-│   ├── grid/              # buffer celle + screen
-│   ├── vt/                # parser input ANSI/VT (ex input.c)
-│   ├── tty/               # output terminale (profilo fisso) + raw mode
-│   ├── pty/               # openpty via syscall
-│   ├── command/           # registry + dispatcher + Ctx (ex §5)
-│   ├── layout/            # split/resize dei pane
-│   └── options/           # opzioni ridotte
+│   ├── server/             # demone: possiede lo stato, serve i client
+│   ├── client/             # comandi one-shot + attach interattivo (raw mode)
+│   ├── ipc/                # protocollo a frame su socket unix
+│   ├── tmux/               # modello sessioni + runtime PTY + ring buffer
+│   ├── pty/                # apertura PTY + avvio processi (syscall Linux)
+│   ├── term/               # raw mode + dimensione terminale (syscall)
+│   └── command/            # registry + parser + Ctx dei comandi
 └── docs/ANALISI.md
 ```
+
+> Nota: le sezioni 1–5 restano lo studio del sorgente tmux e valgono a
+> prescindere dallo scope finale; grid/vt/tty/layout/options non servono nel
+> caso d'uso "solo sessioni" perché è il processo nella PTY a gestire il proprio
+> rendering — `ivt` fa solo da tramite trasparente.

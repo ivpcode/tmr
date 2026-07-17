@@ -15,7 +15,6 @@ var testCmd = &Command{
 		"b": Bool("bool b"),
 		"s": Str("string s"),
 		"n": Int("int n"),
-		"t": Target(tmux.KindSession),
 	},
 	MinArgs: 0,
 	MaxArgs: -1,
@@ -23,8 +22,7 @@ var testCmd = &Command{
 
 func parseArgs(t *testing.T, argv []string) *Ctx {
 	t.Helper()
-	srv := tmux.NewServer()
-	srv.NewSession("s0")
+	srv := tmux.NewServer(nil)
 	c, err := testCmd.parse(srv, argv, &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("parse(%v): %v", argv, err)
@@ -59,16 +57,14 @@ func TestParseCombinedBools(t *testing.T) {
 }
 
 func TestParseAttachedValue(t *testing.T) {
-	// -shello == -s hello
-	c := parseArgs(t, []string{"-shello"})
+	c := parseArgs(t, []string{"-shello"}) // -shello == -s hello
 	if c.Flag("s") != "hello" {
 		t.Errorf("-shello = %q, want hello", c.Flag("s"))
 	}
 }
 
 func TestParseCombinedBoolThenValue(t *testing.T) {
-	// -as x == -a -s x
-	c := parseArgs(t, []string{"-as", "x"})
+	c := parseArgs(t, []string{"-as", "x"}) // -as x == -a -s x
 	if !c.Bool("a") || c.Flag("s") != "x" {
 		t.Errorf("-as x: a=%v s=%q", c.Bool("a"), c.Flag("s"))
 	}
@@ -85,14 +81,14 @@ func TestParseDoubleDash(t *testing.T) {
 }
 
 func TestParseUnknownFlag(t *testing.T) {
-	srv := tmux.NewServer()
+	srv := tmux.NewServer(nil)
 	if _, err := testCmd.parse(srv, []string{"-z"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
 		t.Error("expected error for unknown flag -z")
 	}
 }
 
 func TestParseMissingValue(t *testing.T) {
-	srv := tmux.NewServer()
+	srv := tmux.NewServer(nil)
 	if _, err := testCmd.parse(srv, []string{"-s"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
 		t.Error("expected error for -s without value")
 	}
@@ -100,7 +96,7 @@ func TestParseMissingValue(t *testing.T) {
 
 func TestParseArgBounds(t *testing.T) {
 	min2 := &Command{Name: "m", MinArgs: 2, MaxArgs: 2}
-	srv := tmux.NewServer()
+	srv := tmux.NewServer(nil)
 	if _, err := min2.parse(srv, []string{"only-one"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
 		t.Error("expected error for too few args")
 	}
@@ -111,7 +107,7 @@ func TestParseArgBounds(t *testing.T) {
 
 func TestUsageGeneration(t *testing.T) {
 	got := testCmd.Usage()
-	want := "test [-ab] [-n n] [-s value] [-t session] [args...]"
+	want := "test [-ab] [-n n] [-s value] [args...]"
 	if got != want {
 		t.Errorf("Usage() = %q, want %q", got, want)
 	}

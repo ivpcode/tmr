@@ -23,7 +23,6 @@ const (
 	FlagBool   FlagType = iota // -a           (presence only)
 	FlagString                 // -s name      (string value)
 	FlagInt                    // -n 5         (integer value)
-	FlagTarget                 // -t target    (resolves to a session/window/pane)
 )
 
 // Flag describes a single option. Instead of tmux's "af:t:" string, each flag
@@ -32,15 +31,17 @@ const (
 //	Flags{
 //	    "a": Bool("kill all but current"),
 //	    "s": Str("session name"),
-//	    "t": Target(tmux.KindPane),
 //	}
+//
+// The session commands are positional (they take names as arguments, not
+// flags), so most declare no flags at all; the mechanism stays available for
+// future options.
 type Flag struct {
-	Type   FlagType
-	Help   string
-	Target tmux.TargetKind // only meaningful when Type == FlagTarget
+	Type FlagType
+	Help string
 }
 
-// Bool declares a presence-only flag (e.g. -d).
+// Bool declares a presence-only flag (e.g. -a).
 func Bool(help string) Flag { return Flag{Type: FlagBool, Help: help} }
 
 // Str declares a flag that takes a string value (e.g. -s name).
@@ -48,10 +49,6 @@ func Str(help string) Flag { return Flag{Type: FlagString, Help: help} }
 
 // Int declares a flag that takes an integer value (e.g. -n 5).
 func Int(help string) Flag { return Flag{Type: FlagInt, Help: help} }
-
-// Target declares a -t/-s style flag that names a session, window or pane and
-// is resolved automatically before Run is called.
-func Target(k tmux.TargetKind) Flag { return Flag{Type: FlagTarget, Target: k} }
 
 // Flags maps a single-letter flag name to its declaration.
 type Flags map[string]Flag
@@ -79,7 +76,11 @@ type Command struct {
 type Ctx struct {
 	Cmd    *Command
 	Server *tmux.Server
-	Target *tmux.Target // resolved from the target flag, nil if none
+
+	// Cols/Rows are the requesting client's terminal size, used by commands
+	// that create a pty (e.g. new).
+	Cols uint16
+	Rows uint16
 
 	bools map[string]bool
 	vals  map[string]string
@@ -176,8 +177,9 @@ func All() []*Command {
 }
 
 // Dispatch parses argv against the named command and runs it, writing normal
-// output to out and errors to errw. argv[0] is the command name/alias.
-func Dispatch(srv *tmux.Server, argv []string, out, errw io.Writer) error {
+// output to out and errors to errw. argv[0] is the command name/alias; cols/rows
+// carry the requesting client's terminal size.
+func Dispatch(srv *tmux.Server, argv []string, cols, rows uint16, out, errw io.Writer) error {
 	if len(argv) == 0 {
 		return fmt.Errorf("empty command")
 	}
@@ -192,6 +194,7 @@ func Dispatch(srv *tmux.Server, argv []string, out, errw io.Writer) error {
 		fmt.Fprintf(errw, "%s\nusage: %s\n", err, cmd.Usage())
 		return err
 	}
+	ctx.Cols, ctx.Rows = cols, rows
 	if cmd.Run == nil {
 		return ctx.Errorf("%s: not implemented yet", cmd.Name)
 	}

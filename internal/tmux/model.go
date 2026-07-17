@@ -1,309 +1,342 @@
-// Package tmux holds the core data model: the server and its tree of sessions,
-// windows and panes. It has no dependency on the command or IPC layers so it
-// can be exercised in isolation.
+// Package tmux holds the core model: a server owning a flat set of named
+// sessions. Each session runs one real process in a pseudo-terminal that stays
+// alive while clients attach and detach. There are no windows or panes — the
+// clone is deliberately scoped to session management for long-running agents.
 package tmux
 
 import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/ivpcode/tmr/internal/pty"
 )
 
-// TargetKind is the kind of object a target flag points at.
-type TargetKind int
+// ringSize is how much recent pty output is retained to replay on attach.
+const ringSize = 256 << 10 // 256 KiB
 
-const (
-	KindNone TargetKind = iota
-	KindSession
-	KindWindow
-	KindPane
-	KindClient
-)
+// Control is an out-of-band message sent to an attached client.
+type Control struct {
+	Kind    string // "detached", "switch", "exit"
+	Session string // target session for "switch"
+	Code    int    // process exit code for "exit"
+}
 
-// Server owns all state. In tmux this is a single-threaded event loop guarded by
-// nothing; here concurrent client goroutines touch it, so a mutex protects the
-// tree. Callers should hold nothing else while calling exported methods.
+// Client is a server-side view of one attached client (a running `resume`).
+type Client struct {
+	Out  chan []byte  // pty output destined for this client
+	Ctrl chan Control // out-of-band control messages
+	done chan struct{}
+}
+
+// NewClient makes a client with reasonable buffering.
+func NewClient() *Client {
+	return &Client{
+		Out:  make(chan []byte, 512),
+		Ctrl: make(chan Control, 8),
+		done: make(chan struct{}),
+	}
+}
+
+// Close marks the client finished so broadcasts skip it.
+func (c *Client) Close() { close(c.done) }
+
+// Done is closed when the client is finished; server writers select on it.
+func (c *Client) Done() <-chan struct{} { return c.done }
+
+// Server owns all sessions.
 type Server struct {
-	mu sync.Mutex
+	mu       sync.Mutex
+	sessions map[string]*Session
+	order    []string // session names in creation order
+	nextNum  int      // for auto-generated names
 
-	Sessions map[string]*Session
-	order    []string // session names, insertion order for stable listing
-
-	nextWindowID int
-	nextPaneID   int
-
+	last    *Client // most-recently attached client (target of `to`)
+	onEmpty func()  // invoked when the last session is gone
 	Created time.Time
 }
 
-// Session is a named collection of windows.
+// Session is one named process running in a pty.
 type Session struct {
-	Name     string
-	Windows  []*Window
-	CurWin   int // index into Windows of the active window
-	Created  time.Time
-	Attached int // number of attached clients
-}
-
-// Window is a named collection of panes within a session.
-type Window struct {
-	ID      int
 	Name    string
-	Index   int // display index within the session
-	Panes   []*Pane
-	CurPane int // index into Panes of the active pane
+	Cmd     []string
+	Created time.Time
+
+	srv  *Server
+	proc *pty.Process
+
+	mu       sync.Mutex
+	ring     *ring
+	clients  map[*Client]struct{}
+	exited   bool
+	exitCode int
 }
 
-// Pane is a single terminal region. The PTY/grid/screen fields will be filled
-// in when the rendering layer lands; for now it is an addressable leaf.
-type Pane struct {
-	ID     int
-	Width  int
-	Height int
-	// TODO(rendering): pty *pty.PTY, grid *grid.Grid, screen *screen.Screen
-}
-
-// Target is a resolved (session, window, pane) triple. Any of the tail fields
-// may be nil depending on the requested TargetKind.
-type Target struct {
-	Session *Session
-	Window  *Window
-	Pane    *Pane
-}
-
-// NewServer returns an empty server.
-func NewServer() *Server {
+// NewServer returns an empty server. onEmpty (may be nil) is called once the
+// last session disappears, so the daemon can exit like tmux does.
+func NewServer(onEmpty func()) *Server {
 	return &Server{
-		Sessions: map[string]*Session{},
+		sessions: map[string]*Session{},
+		onEmpty:  onEmpty,
 		Created:  time.Now(),
 	}
 }
 
-// ---- Session/window/pane creation ----------------------------------------
+// ---- Session lifecycle ----------------------------------------------------
 
-// NewSession creates a session with one window and one pane. If name is empty a
-// numeric name is generated (as tmux does).
-func (s *Server) NewSession(name string) (*Session, error) {
+// NewSession creates a session named name (auto-generated if empty) running
+// cmd (the login shell if cmd is empty), sized cols x rows.
+func (s *Server) NewSession(name string, cmd []string, cols, rows uint16) (*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if name == "" {
-		name = s.uniqueSessionName()
+		name = s.uniqueNameLocked()
 	}
-	if _, exists := s.Sessions[name]; exists {
+	if _, dup := s.sessions[name]; dup {
 		return nil, fmt.Errorf("duplicate session: %s", name)
 	}
+	if len(cmd) == 0 {
+		cmd = []string{loginShell()}
+	}
 
-	sess := &Session{Name: name, Created: time.Now()}
-	win := s.newWindowLocked("bash", 0)
-	sess.Windows = append(sess.Windows, win)
+	proc, err := pty.Start(cmd[0], cmd[1:], childEnv(), cols, rows)
+	if err != nil {
+		return nil, err
+	}
 
-	s.Sessions[name] = sess
+	sess := &Session{
+		Name:    name,
+		Cmd:     cmd,
+		Created: time.Now(),
+		srv:     s,
+		proc:    proc,
+		ring:    newRing(ringSize),
+		clients: map[*Client]struct{}{},
+	}
+	s.sessions[name] = sess
 	s.order = append(s.order, name)
+
+	go sess.pump()
 	return sess, nil
 }
 
-func (s *Server) newWindowLocked(name string, index int) *Window {
-	w := &Window{ID: s.nextWindowID, Name: name, Index: index}
-	s.nextWindowID++
-	w.Panes = append(w.Panes, &Pane{ID: s.nextPaneID, Width: 80, Height: 24})
-	s.nextPaneID++
-	return w
-}
-
-func (s *Server) uniqueSessionName() string {
-	for i := 0; ; i++ {
-		name := fmt.Sprintf("%d", i)
-		if _, ok := s.Sessions[name]; !ok {
-			return name
-		}
-	}
-}
-
-// KillSession removes a session by name.
-func (s *Server) KillSession(name string) error {
+// Kill terminates a session's process and removes it.
+func (s *Server) Kill(name string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.Sessions[name]; !ok {
+	sess := s.sessions[name]
+	s.mu.Unlock()
+	if sess == nil {
 		return fmt.Errorf("session not found: %s", name)
 	}
-	delete(s.Sessions, name)
+	sess.proc.Proc.Kill()
+	// pump() will observe the exit and call remove().
+	return nil
+}
+
+// Rename changes a session's name.
+func (s *Server) Rename(oldName, newName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.sessions[oldName]
+	if sess == nil {
+		return fmt.Errorf("session not found: %s", oldName)
+	}
+	if _, dup := s.sessions[newName]; dup {
+		return fmt.Errorf("duplicate session: %s", newName)
+	}
+	delete(s.sessions, oldName)
+	s.sessions[newName] = sess
+	sess.Name = newName
 	for i, n := range s.order {
-		if n == name {
-			s.order = append(s.order[:i], s.order[i+1:]...)
+		if n == oldName {
+			s.order[i] = newName
 			break
 		}
 	}
 	return nil
 }
 
-// SessionList returns sessions in stable insertion order.
-func (s *Server) SessionList() []*Session {
+// List returns sessions in creation order.
+func (s *Server) List() []*Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*Session, 0, len(s.order))
 	for _, n := range s.order {
-		out = append(out, s.Sessions[n])
+		out = append(out, s.sessions[n])
 	}
 	return out
 }
 
-// Empty reports whether the server has no sessions.
-func (s *Server) Empty() bool {
+// Get returns a session by name, or nil.
+func (s *Server) Get(name string) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.Sessions) == 0
+	return s.sessions[name]
 }
 
-// ---- Target resolution ----------------------------------------------------
-
-// ResolveTarget maps a target string to a concrete object. This is the small
-// replacement for tmux's 1300-line cmd-find.c. When given is false (no -t on
-// the command line) it falls back to the current/most-recent object.
-//
-// Accepted forms:
-//
-//	session                 (session, or — for window/pane kinds — its current window/pane)
-//	session:window          window within a session
-//	session:window.pane     pane within a window
-//	window / window.pane    within the current session (no colon)
-func (s *Server) ResolveTarget(kind TargetKind, spec string, given bool) (*Target, error) {
-	if kind == KindNone {
-		return nil, nil
+func (s *Server) uniqueNameLocked() string {
+	for {
+		name := fmt.Sprintf("%d", s.nextNum)
+		s.nextNum++
+		if _, ok := s.sessions[name]; !ok {
+			return name
+		}
 	}
+}
+
+func (s *Server) remove(name string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !given || spec == "" {
-		return s.currentTargetLocked(kind)
-	}
-
-	// Determine the session and the remaining "window[.pane]" part.
-	var sess *Session
-	var rest string
-	if before, after, hasColon := cut(spec, ':'); hasColon {
-		sess = s.Sessions[before]
-		if sess == nil {
-			return nil, fmt.Errorf("can't find session: %s", before)
-		}
-		rest = after
-	} else if kind == KindSession {
-		sess = s.Sessions[spec]
-		if sess == nil {
-			return nil, fmt.Errorf("can't find session: %s", spec)
-		}
-		return &Target{Session: sess}, nil
-	} else if named, ok := s.Sessions[spec]; ok {
-		// Bare name that matches a session: target its current window/pane.
-		sess = named
-	} else {
-		// Bare "window[.pane]" resolved against the current session.
-		sess = s.currentSessionLocked()
-		if sess == nil {
-			return nil, fmt.Errorf("no current session")
-		}
-		rest = spec
-	}
-
-	t := &Target{Session: sess}
-	if kind == KindSession {
-		return t, nil
-	}
-
-	// Resolve the window, defaulting to the current one when rest is empty.
-	winName, paneStr := split(rest, '.')
-	if rest == "" {
-		t.Window = sess.current()
-	} else {
-		t.Window = sess.findWindow(winName)
-		if t.Window == nil {
-			return nil, fmt.Errorf("can't find window: %s", winName)
+	delete(s.sessions, name)
+	for i, n := range s.order {
+		if n == name {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
 		}
 	}
-	if kind == KindWindow || t.Window == nil {
-		return t, nil
+	empty := len(s.sessions) == 0
+	onEmpty := s.onEmpty
+	s.mu.Unlock()
+	if empty && onEmpty != nil {
+		onEmpty()
 	}
-
-	// Resolve the pane, defaulting to the window's active pane.
-	if paneStr == "" {
-		if t.Window.CurPane < len(t.Window.Panes) {
-			t.Pane = t.Window.Panes[t.Window.CurPane]
-		}
-	} else {
-		t.Pane = t.Window.findPane(paneStr)
-		if t.Pane == nil {
-			return nil, fmt.Errorf("can't find pane: %s", paneStr)
-		}
-	}
-	return t, nil
 }
 
-func (s *Server) currentTargetLocked(kind TargetKind) (*Target, error) {
-	sess := s.currentSessionLocked()
+// ---- Attach / detach / switch --------------------------------------------
+
+// DetachClients tells every client attached to name to detach.
+func (s *Server) DetachClients(name string) error {
+	sess := s.Get(name)
 	if sess == nil {
-		return nil, fmt.Errorf("no current session")
+		return fmt.Errorf("session not found: %s", name)
 	}
-	t := &Target{Session: sess}
-	if kind == KindSession {
-		return t, nil
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if len(sess.clients) == 0 {
+		return fmt.Errorf("session %s has no attached client", name)
 	}
-	win := sess.current()
-	t.Window = win
-	if kind == KindWindow || win == nil {
-		return t, nil
-	}
-	if win.CurPane < len(win.Panes) {
-		t.Pane = win.Panes[win.CurPane]
-	}
-	return t, nil
-}
-
-func (s *Server) currentSessionLocked() *Session {
-	if len(s.order) == 0 {
-		return nil
-	}
-	// Most-recently created session; good enough until we track a real
-	// "current session" per client.
-	return s.Sessions[s.order[len(s.order)-1]]
-}
-
-func (sess *Session) current() *Window {
-	if sess.CurWin < len(sess.Windows) {
-		return sess.Windows[sess.CurWin]
+	for c := range sess.clients {
+		sendCtrl(c, Control{Kind: "detached"})
 	}
 	return nil
 }
 
-func (sess *Session) findWindow(nameOrIndex string) *Window {
-	for _, w := range sess.Windows {
-		if w.Name == nameOrIndex || fmt.Sprintf("%d", w.Index) == nameOrIndex {
-			return w
-		}
+// SwitchActive asks the most-recently-attached client to switch to session
+// name. Used by the `to` command from another terminal.
+func (s *Server) SwitchActive(name string) error {
+	if s.Get(name) == nil {
+		return fmt.Errorf("session not found: %s", name)
 	}
+	s.mu.Lock()
+	c := s.last
+	s.mu.Unlock()
+	if c == nil {
+		return fmt.Errorf("no attached client to switch")
+	}
+	sendCtrl(c, Control{Kind: "switch", Session: name})
 	return nil
 }
 
-func (w *Window) findPane(idStr string) *Pane {
-	for _, p := range w.Panes {
-		if fmt.Sprintf("%d", p.ID) == idStr {
-			return p
+// Attach registers c with the session, sizes the pty and replays recent output.
+func (sess *Session) Attach(c *Client, cols, rows uint16) {
+	sess.Resize(cols, rows)
+	sess.mu.Lock()
+	sess.clients[c] = struct{}{}
+	backlog := sess.ring.Bytes()
+	sess.mu.Unlock()
+
+	sess.srv.mu.Lock()
+	sess.srv.last = c
+	sess.srv.mu.Unlock()
+
+	if len(backlog) > 0 {
+		select {
+		case c.Out <- backlog:
+		case <-c.done:
 		}
 	}
-	return nil
 }
 
-// split cuts s at the first occurrence of sep, returning (before, after). If
-// sep is absent, after is "".
-func split(s string, sep byte) (string, string) {
-	before, after, _ := cut(s, sep)
-	return before, after
+// Detach unregisters c from the session.
+func (sess *Session) Detach(c *Client) {
+	sess.mu.Lock()
+	delete(sess.clients, c)
+	sess.mu.Unlock()
 }
 
-// cut splits s at the first sep, reporting whether sep was found.
-func cut(s string, sep byte) (before, after string, found bool) {
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			return s[:i], s[i+1:], true
+// WriteInput forwards client keystrokes to the pty.
+func (sess *Session) WriteInput(p []byte) {
+	sess.proc.Master.Write(p)
+}
+
+// Resize changes the pty window size.
+func (sess *Session) Resize(cols, rows uint16) {
+	pty.Setsize(sess.proc.Master, cols, rows)
+}
+
+// Attached reports how many clients are attached.
+func (sess *Session) Attached() int {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return len(sess.clients)
+}
+
+// pump reads pty output, feeds the ring buffer and broadcasts to clients until
+// the process exits, then notifies clients and removes the session.
+func (sess *Session) pump() {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := sess.proc.Master.Read(buf)
+		if n > 0 {
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			sess.broadcast(chunk)
+		}
+		if err != nil {
+			break
 		}
 	}
-	return s, "", false
+
+	code := waitCode(sess.proc.Wait())
+
+	sess.mu.Lock()
+	sess.exited = true
+	sess.exitCode = code
+	clients := make([]*Client, 0, len(sess.clients))
+	for c := range sess.clients {
+		clients = append(clients, c)
+	}
+	sess.mu.Unlock()
+
+	for _, c := range clients {
+		sendCtrl(c, Control{Kind: "exit", Code: code})
+	}
+	sess.srv.remove(sess.Name)
+	sess.proc.Master.Close()
+}
+
+// broadcast stores a chunk in the ring and sends a copy to every live client.
+func (sess *Session) broadcast(chunk []byte) {
+	sess.mu.Lock()
+	sess.ring.Write(chunk)
+	clients := make([]*Client, 0, len(sess.clients))
+	for c := range sess.clients {
+		clients = append(clients, c)
+	}
+	sess.mu.Unlock()
+
+	for _, c := range clients {
+		select {
+		case c.Out <- chunk:
+		case <-c.done:
+		}
+	}
+}
+
+// sendCtrl delivers a control message without blocking on a dead client.
+func sendCtrl(c *Client, m Control) {
+	select {
+	case c.Ctrl <- m:
+	case <-c.done:
+	}
 }
