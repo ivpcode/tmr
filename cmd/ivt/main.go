@@ -6,17 +6,18 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
 	"github.com/ivpcode/tmr/internal/client"
 	"github.com/ivpcode/tmr/internal/server"
 	"github.com/ivpcode/tmr/internal/term"
+	"github.com/ivpcode/tmr/internal/web"
 )
 
 const usage = `usage: ivt <command> [args]
@@ -28,6 +29,7 @@ const usage = `usage: ivt <command> [args]
   ls                                         list sessions
   rename  | rn  <old> <new>                  rename a session
   to            <name>                       switch the active client to a session
+  web           [-p port] [-l] [-t token]    web UI: session list + browser terminal
 
 Inside a session, press Ctrl-\ to detach (the session keeps running).
 Socket: $IVT_SOCK or /tmp/ivt-<uid>/default.`
@@ -57,6 +59,28 @@ func run(argv []string) int {
 		}
 		return 0
 
+	case "web":
+		fs := flag.NewFlagSet("web", flag.ContinueOnError)
+		port := fs.Int("p", 7681, "listen port")
+		lan := fs.Bool("l", false, "listen on all interfaces (default: localhost only)")
+		token := fs.String("t", "", "access token (default: generated)")
+		if err := fs.Parse(argv[1:]); err != nil {
+			return 1
+		}
+		host := "127.0.0.1"
+		if *lan {
+			host = ""
+		}
+		if err := web.Run(web.Config{
+			Addr:  net.JoinHostPort(host, strconv.Itoa(*port)),
+			Sock:  sock,
+			Token: *token,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "ivt: web: %v\n", err)
+			return 1
+		}
+		return 0
+
 	case "resume", "r":
 		if len(argv) != 2 {
 			fmt.Fprintln(os.Stderr, "usage: ivt resume <session>")
@@ -69,7 +93,7 @@ func run(argv []string) int {
 		return attach(sock, argv[1])
 
 	case "new", "n":
-		if err := ensureServer(sock); err != nil {
+		if err := client.EnsureServer(sock); err != nil {
 			fmt.Fprintf(os.Stderr, "ivt: %v\n", err)
 			return 1
 		}
@@ -116,45 +140,6 @@ func attach(sock, session string) int {
 		return 1
 	}
 	return code
-}
-
-// ensureServer starts the daemon in the background if it isn't already running.
-func ensureServer(sock string) error {
-	if client.ServerRunning(sock) {
-		return nil
-	}
-	dir := filepath.Dir(sock)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command(exe, "server")
-	cmd.Stdin = nil
-	// Keep the daemon's (rare) diagnostics next to the socket.
-	if logf, err := os.OpenFile(filepath.Join(dir, "server.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
-		cmd.Stdout, cmd.Stderr = logf, logf
-		defer logf.Close()
-	}
-	// Detach the daemon into its own session with no controlling terminal, so
-	// it survives the client's terminal closing (SIGHUP) on detach.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	_ = cmd.Process.Release()
-
-	// Wait up to ~2s for the server to start listening.
-	for i := 0; i < 200; i++ {
-		if client.ServerRunning(sock) {
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return fmt.Errorf("server did not start")
 }
 
 // socketPath returns the unix-socket path for this user.

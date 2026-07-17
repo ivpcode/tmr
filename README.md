@@ -18,9 +18,10 @@ di riduzione sono in [`docs/ANALISI.md`](docs/ANALISI.md).
 | `resume` | `r` | `<nome>` | Si attacca a una sessione esistente. |
 | `detach` | `d` | `<nome>` | Stacca i client da una sessione (da un altro terminale). |
 | `kill` | | `<nome>` | Distrugge una sessione e il suo processo. |
-| `ls` | | | Elenca le sessioni. |
+| `ls` | | `[-j]` | Elenca le sessioni (`-j` per output JSON). |
 | `rename` | `rn` | `<vecchio> <nuovo>` | Rinomina una sessione. |
 | `to` | | `<nome>` | Sposta il client attivo su un'altra sessione. |
+| `web` | | `[-p porta] [-l] [-t token]` | Interfaccia web: lista sessioni + terminale nel browser. |
 
 Per staccarsi dall'interno di una sessione si preme **`Ctrl-\`** (la sessione
 resta viva). In alternativa, da un altro terminale: `ivt detach <nome>`.
@@ -53,6 +54,31 @@ sessione viene chiusa. Il socket è `$IVT_SOCK`, altrimenti
 finiscono in `server.log` accanto al socket. `kill` termina l'**intero process
 group** della sessione, quindi anche i processi figli lanciati dalla shell.
 
+## Interfaccia web
+
+```sh
+ivt web                 # http://127.0.0.1:7681/?t=<token generato>
+ivt web -p 9000 -l      # porta 9000, in ascolto su tutte le interfacce
+ivt web -t miotoken     # token fisso invece di quello generato
+```
+
+`ivt web` avvia un gateway HTTP che mostra la **lista delle sessioni attive**
+(auto-aggiornata, con età e client attaccati) e, cliccando su una sessione,
+apre un **terminale completo nel browser** ([xterm.js](https://xtermjs.org),
+incorporato nel binario): si lavora nella stessa identica sessione della CLI,
+con replay dello scrollback, resize automatico e creazione/kill delle sessioni
+dalla pagina. Chiudere la scheda equivale a un detach: la sessione continua.
+
+L'accesso richiede sempre il **token** stampato all'avvio (query `?t=` al primo
+accesso, poi cookie): senza token ogni richiesta è respinta, anche su
+localhost. Con `-l` il gateway è raggiungibile dalla rete — il traffico è HTTP
+in chiaro, quindi in ambienti non fidati va messo dietro un reverse proxy TLS o
+un tunnel SSH (`ssh -L 7681:localhost:7681 host`).
+
+Il gateway è un normale client del demone: fa da ponte tra WebSocket (RFC 6455
+implementato su stdlib, `internal/ws`) e il protocollo IPC. CLI e browser
+possono essere attaccati alla stessa sessione contemporaneamente.
+
 ## Architettura (zero dipendenze)
 
 | Package | Ruolo | Cosa sostituisce di tmux |
@@ -64,9 +90,13 @@ group** della sessione, quindi anche i processi figli lanciati dalla shell.
 | `internal/term` | raw mode e dimensione del terminale (syscall) | termios/terminfo |
 | `internal/ipc` | protocollo binario a frame su socket unix | libevent + imsg |
 | `internal/command` | registry + parser + Ctx dei comandi | cmd.c + arguments.c |
+| `internal/ws` | server WebSocket minimale (RFC 6455) | — |
+| `internal/web` | gateway HTTP: lista sessioni + terminale browser | — |
 
-Nessun uso di `cgo`. L'event loop di libevent è sostituito da goroutine e
-channel; terminfo da un profilo terminale fisso (`xterm-256color`).
+Nessun uso di `cgo` e nessun modulo Go esterno. L'event loop di libevent è
+sostituito da goroutine e channel; terminfo da un profilo terminale fisso
+(`xterm-256color`). L'unico codice di terzi è **xterm.js** (MIT), incorporato
+nel binario con `go:embed` per il terminale web — nessun CDN a runtime.
 
 ## Come funziona l'attach
 

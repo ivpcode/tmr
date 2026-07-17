@@ -4,6 +4,7 @@
 package cmds
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -44,12 +45,34 @@ var newSession = &command.Command{
 	},
 }
 
-// ls — list sessions
+// ls [-j] — list sessions (as text, or as JSON for machine consumers)
 var lsSessions = &command.Command{
 	Name:    "ls",
 	Summary: "list sessions",
+	Flags: command.Flags{
+		"j": command.Bool("JSON output"),
+	},
 	Run: func(c *command.Ctx) error {
-		for _, s := range c.Server.List() {
+		list := c.Server.List()
+		if c.Bool("j") {
+			type row struct {
+				Name     string   `json:"name"`
+				Cmd      []string `json:"cmd"`
+				Created  int64    `json:"created"`
+				Attached int      `json:"attached"`
+			}
+			rows := make([]row, len(list))
+			for i, s := range list {
+				rows[i] = row{s.Name, s.Cmd, s.Created.Unix(), s.Attached}
+			}
+			out, err := json.Marshal(rows)
+			if err != nil {
+				return c.Errorf("%v", err)
+			}
+			c.Printf("%s\n", out)
+			return nil
+		}
+		for _, s := range list {
 			mark := ""
 			if s.Attached > 0 {
 				mark = " (attached)"

@@ -113,6 +113,9 @@ func (s *Server) NewSession(name string, cmd []string, cols, rows uint16) (*Sess
 	if name == "" {
 		name = s.uniqueNameLocked()
 	}
+	if !validName(name) {
+		return nil, fmt.Errorf("invalid session name: %q", name)
+	}
 	if _, dup := s.sessions[name]; dup {
 		return nil, fmt.Errorf("duplicate session: %s", name)
 	}
@@ -169,6 +172,9 @@ func (s *Server) Kill(name string) error {
 
 // Rename changes a session's name.
 func (s *Server) Rename(oldName, newName string) error {
+	if !validName(newName) {
+		return fmt.Errorf("invalid session name: %q", newName)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := s.sessions[oldName]
@@ -212,6 +218,21 @@ func (s *Server) Get(name string) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sessions[name]
+}
+
+// validName rejects names that would break addressing: whitespace and control
+// characters, '/' (they appear in web URLs) and ':' (reserved), plus a leading
+// '-' that would parse as a flag.
+func validName(s string) bool {
+	if s == "" || s[0] == '-' {
+		return false
+	}
+	for _, r := range s {
+		if r <= ' ' || r == 0x7f || r == '/' || r == ':' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) uniqueNameLocked() string {
