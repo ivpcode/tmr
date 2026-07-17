@@ -21,7 +21,7 @@ di riduzione sono in [`docs/ANALISI.md`](docs/ANALISI.md).
 | `ls` | | `[-j]` | Elenca le sessioni (`-j` per output JSON). |
 | `rename` | `rn` | `<vecchio> <nuovo>` | Rinomina una sessione. |
 | `to` | | `<nome>` | Sposta il client attivo su un'altra sessione. |
-| `web` | | `[-p porta] [-l] [-t token]` | Interfaccia web: lista sessioni + terminale nel browser. |
+| `web` | | `[-t token] <porta\|host:porta>` | Interfaccia web (HTTPS): lista sessioni + terminale nel browser. |
 
 Per staccarsi dall'interno di una sessione si preme **`Ctrl-\`** (la sessione
 resta viva). In alternativa, da un altro terminale: `ivt detach <nome>`.
@@ -57,23 +57,30 @@ group** della sessione, quindi anche i processi figli lanciati dalla shell.
 ## Interfaccia web
 
 ```sh
-ivt web                 # http://127.0.0.1:7681/?t=<token generato>
-ivt web -p 9000 -l      # porta 9000, in ascolto su tutte le interfacce
-ivt web -t miotoken     # token fisso invece di quello generato
+ivt web 9000                  # tutte le interfacce (0.0.0.0:9000)
+ivt web 127.0.0.1:9000        # solo localhost
+ivt web 192.168.1.234:9000    # una interfaccia specifica
+ivt web -t miotoken 9000      # token fisso invece di quello generato
 ```
 
-`ivt web` avvia un gateway HTTP che mostra la **lista delle sessioni attive**
-(auto-aggiornata, con età e client attaccati) e, cliccando su una sessione,
-apre un **terminale completo nel browser** ([xterm.js](https://xtermjs.org),
-incorporato nel binario): si lavora nella stessa identica sessione della CLI,
-con replay dello scrollback, resize automatico e creazione/kill delle sessioni
-dalla pagina. Chiudere la scheda equivale a un detach: la sessione continua.
+L'indirizzo è **obbligatorio** (nessuna porta di default): un numero da solo
+significa "quella porta su tutte le interfacce", `host:porta` limita l'ascolto
+a quell'indirizzo. All'avvio vengono stampati gli URL pronti da aprire.
 
-L'accesso richiede sempre il **token** stampato all'avvio (query `?t=` al primo
-accesso, poi cookie): senza token ogni richiesta è respinta, anche su
-localhost. Con `-l` il gateway è raggiungibile dalla rete — il traffico è HTTP
-in chiaro, quindi in ambienti non fidati va messo dietro un reverse proxy TLS o
-un tunnel SSH (`ssh -L 7681:localhost:7681 host`).
+Il gateway mostra la **lista delle sessioni attive** (auto-aggiornata, con età
+e client attaccati) e, cliccando su una sessione, apre un **terminale completo
+nel browser** ([xterm.js](https://xtermjs.org), incorporato nel binario): si
+lavora nella stessa identica sessione della CLI, con replay dello scrollback,
+resize automatico e creazione/kill delle sessioni dalla pagina. Chiudere la
+scheda equivale a un detach: la sessione continua.
+
+**Il traffico è sempre HTTPS** (WebSocket compreso: `wss`), mai HTTP in chiaro:
+alla prima esecuzione viene generato un certificato **autofirmato** ECDSA
+valido 10 anni, persistito in `~/.config/ivt/` — il browser chiede conferma
+solo al primo accesso e l'eccezione resta valida ai riavvii. L'accesso
+richiede sempre il **token** stampato all'avvio (query `?t=` la prima volta,
+poi cookie `Secure`): senza token ogni richiesta è respinta, anche da
+localhost.
 
 Il gateway è un normale client del demone: fa da ponte tra WebSocket (RFC 6455
 implementato su stdlib, `internal/ws`) e il protocollo IPC. CLI e browser

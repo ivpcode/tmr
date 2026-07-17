@@ -8,10 +8,8 @@ package main
 import (
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/ivpcode/tmr/internal/client"
@@ -29,7 +27,8 @@ const usage = `usage: ivt <command> [args]
   ls                                         list sessions
   rename  | rn  <old> <new>                  rename a session
   to            <name>                       switch the active client to a session
-  web           [-p port] [-l] [-t token]    web UI: session list + browser terminal
+  web           [-t token] <porta|host:porta>  web UI (HTTPS): session list + browser terminal
+                  es.: web 9000 (tutte le interfacce) | web 127.0.0.1:9000 (solo locale)
 
 Inside a session, press Ctrl-\ to detach (the session keeps running).
 Socket: $IVT_SOCK or /tmp/ivt-<uid>/default.`
@@ -61,21 +60,23 @@ func run(argv []string) int {
 
 	case "web":
 		fs := flag.NewFlagSet("web", flag.ContinueOnError)
-		port := fs.Int("p", 7681, "listen port")
-		lan := fs.Bool("l", false, "listen on all interfaces (default: localhost only)")
 		token := fs.String("t", "", "access token (default: generated)")
 		if err := fs.Parse(argv[1:]); err != nil {
 			return 1
 		}
-		host := "127.0.0.1"
-		if *lan {
-			host = ""
+		if fs.NArg() != 1 {
+			fmt.Fprintln(os.Stderr, `usage: ivt web [-t token] <porta|host:porta>
+  ivt web 9000                tutte le interfacce (0.0.0.0:9000)
+  ivt web 127.0.0.1:9000      solo localhost
+  ivt web 192.168.1.234:9000  una interfaccia specifica`)
+			return 1
 		}
-		if err := web.Run(web.Config{
-			Addr:  net.JoinHostPort(host, strconv.Itoa(*port)),
-			Sock:  sock,
-			Token: *token,
-		}); err != nil {
+		addr, err := web.ParseAddr(fs.Arg(0))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ivt: web: %v\n", err)
+			return 1
+		}
+		if err := web.Run(web.Config{Addr: addr, Sock: sock, Token: *token}); err != nil {
 			fmt.Fprintf(os.Stderr, "ivt: web: %v\n", err)
 			return 1
 		}

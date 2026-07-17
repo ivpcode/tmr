@@ -10,12 +10,14 @@ package web
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"crypto/tls"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/ivpcode/tmr/internal/client"
@@ -27,9 +29,33 @@ var assets embed.FS
 
 // Config is the gateway configuration.
 type Config struct {
-	Addr  string // listen address, e.g. "127.0.0.1:7681" or ":7681"
+	Addr  string // listen address from ParseAddr, e.g. ":9000" or "127.0.0.1:9000"
 	Sock  string // ivt daemon unix socket path
 	Token string // access token; generated if empty
+}
+
+// ParseAddr turns the web command's address argument into a listen address:
+//
+//	"9000"               -> ":9000"            (all interfaces)
+//	"127.0.0.1:9000"     -> "127.0.0.1:9000"   (localhost only)
+//	"192.168.1.234:9000" -> as given           (one interface)
+//
+// There is no default port: the argument is mandatory.
+func ParseAddr(arg string) (string, error) {
+	if p, err := strconv.Atoi(arg); err == nil {
+		if p < 1 || p > 65535 {
+			return "", fmt.Errorf("porta non valida: %s", arg)
+		}
+		return ":" + arg, nil
+	}
+	_, port, err := net.SplitHostPort(arg)
+	if err != nil {
+		return "", fmt.Errorf("indirizzo non valido %q: usa <porta> oppure <host:porta>", arg)
+	}
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		return "", fmt.Errorf("porta non valida in %q", arg)
+	}
+	return arg, nil
 }
 
 // Server is the running gateway.
@@ -46,30 +72,57 @@ func NewToken() string {
 	return hex.EncodeToString(b)
 }
 
-// Run serves the gateway forever (until the listener fails). It prints the
-// ready-to-open URL on stdout before blocking.
+// Run serves the gateway forever (until the listener fails). It always speaks
+// HTTPS with a persistent self-signed certificate — never plain HTTP — and
+// prints the ready-to-open URLs on stdout before blocking.
 func Run(cfg Config) error {
 	if cfg.Token == "" {
 		cfg.Token = NewToken()
 	}
 	s := &Server{cfg: cfg}
 
+	dir, err := certDir(cfg.Sock)
+	if err != nil {
+		return err
+	}
+	cert, certPath, err := loadOrCreateCert(dir)
+	if err != nil {
+		return err
+	}
+
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ivt web: http://%s/?t=%s\n", displayAddr(ln.Addr().String()), cfg.Token)
-	return http.Serve(ln, s.handler())
+	printURLs(ln.Addr().String(), cfg.Token)
+	fmt.Printf("certificato autofirmato: %s (il browser chiede conferma al primo accesso)\n", certPath)
+
+	tlsLn := tls.NewListener(ln, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	})
+	return http.Serve(tlsLn, s.handler())
 }
 
-// displayAddr rewrites wildcard listen addresses into something clickable.
-func displayAddr(addr string) string {
-	if host, port, err := net.SplitHostPort(addr); err == nil {
-		if host == "::" || host == "0.0.0.0" || host == "" {
-			return "localhost:" + port + "  (in ascolto su tutte le interfacce)"
+// printURLs lists the URLs the gateway answers on: one for a specific host,
+// or every local address when listening on all interfaces.
+func printURLs(lnAddr, token string) {
+	host, port, err := net.SplitHostPort(lnAddr)
+	if err != nil {
+		fmt.Printf("ivt web: https://%s/?t=%s\n", lnAddr, token)
+		return
+	}
+	if host != "" && host != "::" && host != "0.0.0.0" {
+		fmt.Printf("ivt web: https://%s/?t=%s\n", net.JoinHostPort(host, port), token)
+		return
+	}
+	fmt.Println("ivt web in ascolto su tutte le interfacce:")
+	fmt.Printf("  https://localhost:%s/?t=%s\n", port, token)
+	for _, ip := range localIPs() {
+		if ip.To4() != nil { // gli URL IPv4 sono i più comodi da copiare
+			fmt.Printf("  https://%s/?t=%s\n", net.JoinHostPort(ip.String(), port), token)
 		}
 	}
-	return addr
 }
 
 func (s *Server) handler() http.Handler {
@@ -109,7 +162,8 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		if r.URL.Query().Get("t") != "" {
 			http.SetCookie(w, &http.Cookie{
 				Name: tokenCookie, Value: s.cfg.Token,
-				Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode,
+				Path: "/", HttpOnly: true, Secure: true,
+				SameSite: http.SameSiteStrictMode,
 			})
 		}
 		next(w, r)
