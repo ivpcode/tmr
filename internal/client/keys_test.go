@@ -74,6 +74,12 @@ func TestStatusLineWidthAndContent(t *testing.T) {
 	}
 }
 
+func TestSetTitle(t *testing.T) {
+	if got := string(setTitle("work")); got != "\x1b]0;work\x07" {
+		t.Errorf("setTitle = %q", got)
+	}
+}
+
 func TestStatusLineNarrowTerminal(t *testing.T) {
 	// Must not panic nor overflow on tiny widths; the clock is dropped.
 	bar := string(statusLine(10, 5, "longsessionname", time.Now()))

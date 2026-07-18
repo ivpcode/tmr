@@ -43,6 +43,11 @@ stile tmux: nome della sessione a sinistra, **ora e data** a destra. La PTY
 della sessione è alta una riga in meno e una scroll region protegge la barra
 dall'output dell'applicazione. Il terminale web ha la stessa barra.
 
+Anche il **titolo della finestra/tab del terminale** diventa il nome della
+sessione (non l'eseguibile attivo): viene ri-affermato ogni secondo, quindi
+resta corretto anche se l'applicazione lo cambia, e al detach il titolo
+originale viene ripristinato.
+
 Se il processo della sessione termina mentre sei attaccato, `ivt` esce con **lo
 stesso exit code** del processo — utile negli script che lanciano agenti.
 
