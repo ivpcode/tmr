@@ -34,7 +34,11 @@ const usage = `usage: ivt <command> [args]
                   es.: web 9000 (tutte le interfacce) | web 127.0.0.1:9000 (solo locale)
   version                                    print the ivt version
 
-Inside a session, press Ctrl-\ to detach (the session keeps running).
+Key bindings inside a session (tmux-style prefix Ctrl-B):
+  Ctrl-B d        detach (the session keeps running)
+  Ctrl-B n / p    switch to the next / previous session  (also ) and ()
+  Ctrl-B Ctrl-B   send a literal Ctrl-B to the application
+
 Socket: $IVT_SOCK or /tmp/ivt-<uid>/default.`
 
 func main() {
