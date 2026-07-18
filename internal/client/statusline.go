@@ -15,7 +15,13 @@ const (
 	saveCursor    = "\x1b7"
 	restoreCursor = "\x1b8"
 	resetRegion   = "\x1b[r"
-	barStyle      = "\x1b[0;44;97m" // bright white on blue
+
+	// barStyle paints white on blue #1f6feb (the same blue as the web UI).
+	// The ANSI palette slot "blue" (SGR 44) is remappable by terminal themes
+	// (some render it orange!), so the color is forced explicitly: first a
+	// 256-color fixed-cube fallback (indexes >= 16 are not theme-remappable),
+	// then a truecolor override for terminals that support it.
+	barStyle = "\x1b[0;38;5;231;48;5;27m\x1b[38;2;255;255;255;48;2;31;111;235m"
 
 	pushTitle = "\x1b[22;0t" // save the window title on the terminal's title stack
 	popTitle  = "\x1b[23;0t" // restore it (best effort: not every emulator supports the stack)
