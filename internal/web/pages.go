@@ -117,9 +117,14 @@ const terminalHTML = `<!doctype html>
            background: #161b22; color: #e6edf3; font: 14px system-ui, sans-serif; }
   header a { color: #58a6ff; text-decoration: none; }
   header .name { font-weight: 600; }
+  header .hint { color: #8b949e; font-size: .8rem; }
   header .status { margin-left: auto; color: #8b949e; font-size: .85rem; }
   #term { flex: 1; padding: .4rem; min-height: 0; }
   .xterm { height: 100%; }
+  footer { display: flex; justify-content: space-between; align-items: center;
+           background: #1f6feb; color: #fff; padding: .18rem .7rem;
+           font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  footer .sess { font-weight: 700; }
   #overlay { position: fixed; inset: 0; display: none; align-items: center;
              justify-content: center; background: #0d1117cc; }
   #overlay .box { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
@@ -132,9 +137,11 @@ const terminalHTML = `<!doctype html>
 <header>
   <a href="/">&larr; sessioni</a>
   <span class="name">{{NAME}}</span>
+  <span class="hint">Ctrl-B d stacca · Ctrl-B n/p cambia sessione</span>
   <span class="status" id="status">connessione…</span>
 </header>
 <div id="term"></div>
+<footer><span class="sess">[{{NAME}}]</span><span id="bar-clock"></span></footer>
 <div id="overlay"><div class="box" id="overlay-msg"></div></div>
 <script src="/assets/xterm.js"></script>
 <script src="/assets/addon-fit.js"></script>
@@ -181,7 +188,43 @@ ws.onclose = () => { status('disconnesso');
   if (document.getElementById('overlay').style.display !== 'flex')
     overlay('Connessione persa.<br><br><a href="">Riconnetti</a> · <a href="/">Sessioni</a>'); };
 
-term.onData(d => { if (ws.readyState === 1) ws.send(enc.encode(d)); });
+// Prefix Ctrl-B in stile tmux: d stacca, n/p (o )/() cambia sessione,
+// Ctrl-B Ctrl-B invia un Ctrl-B letterale; altri tasti dopo il prefix
+// vengono ignorati. Speculare a internal/client/keys.go.
+let inPrefix = false;
+function feedKeys(d) {
+  let out = '';
+  for (const ch of d) {
+    if (inPrefix) {
+      inPrefix = false;
+      if (ch === '\x02') out += ch;
+      else if (ch === 'd') detachNow();
+      else if (ch === 'n' || ch === ')') switchSession(1);
+      else if (ch === 'p' || ch === '(') switchSession(-1);
+      continue;
+    }
+    if (ch === '\x02') { inPrefix = true; continue; }
+    out += ch;
+  }
+  return out;
+}
+function detachNow() {
+  overlay('Sessione staccata.<br><br><a href="">Riattacca</a> · <a href="/">Sessioni</a>');
+  ws.close();
+}
+async function switchSession(step) {
+  try {
+    const list = await (await fetch('/api/sessions')).json();
+    if (list.length < 2) return;
+    let i = list.findIndex(s => s.name === NAME);
+    if (i < 0) i = 0;
+    const target = list[(i + step + list.length) % list.length].name;
+    location.href = '/s/' + encodeURIComponent(target);
+  } catch (e) { /* demone non raggiungibile: resta qui */ }
+}
+
+term.onData(d => { const out = feedKeys(d);
+  if (out && ws.readyState === 1) ws.send(enc.encode(out)); });
 term.onBinary(d => { if (ws.readyState === 1) {
   const b = new Uint8Array(d.length);
   for (let i = 0; i < d.length; i++) b[i] = d.charCodeAt(i) & 255;
@@ -191,6 +234,16 @@ term.onResize(({ cols, rows }) => { status(cols + '×' + rows);
   if (ws.readyState === 1) ws.send(JSON.stringify({ cols, rows })); });
 
 new ResizeObserver(() => fit.fit()).observe(document.getElementById('term'));
+
+// Orologio della status bar (come tmux: ora e data a destra).
+function barClock() {
+  const d = new Date();
+  document.getElementById('bar-clock').textContent =
+    d.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' }) +
+    '  ' + d.toLocaleDateString('it-IT');
+}
+barClock();
+setInterval(barClock, 1000);
 </script>
 </body>
 </html>`

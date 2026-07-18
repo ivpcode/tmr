@@ -5,20 +5,18 @@
 package client
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ivpcode/tmr/internal/ipc"
 	"github.com/ivpcode/tmr/internal/term"
 )
-
-// detachKey is the byte that detaches the client locally (Ctrl-\), leaving the
-// session running. Detaching from another terminal via `ivt detach` also works.
-const detachKey = 0x1c
 
 // ServerRunning reports whether a server is listening on sockPath.
 func ServerRunning(sockPath string) bool {
@@ -85,8 +83,8 @@ func Attach(sockPath, session string) (int, error) {
 	}()
 
 	stdinCh := make(chan []byte, 16)
-	detachCh := make(chan struct{}, 1)
-	go readStdin(stdinCh, detachCh)
+	actionCh := make(chan byte, 8)
+	go readStdin(stdinCh, actionCh)
 
 	winchCh := make(chan struct{}, 1)
 	sigCh := make(chan os.Signal, 1)
@@ -103,7 +101,7 @@ func Attach(sockPath, session string) (int, error) {
 
 	cur := session
 	for {
-		act, err := stream(sockPath, cur, stdinCh, detachCh, winchCh)
+		act, err := stream(sockPath, cur, stdinCh, actionCh, winchCh)
 		if err != nil {
 			return 1, err
 		}
@@ -126,8 +124,10 @@ func Attach(sockPath, session string) (int, error) {
 	}
 }
 
-// stream runs one attach connection and returns how it ended.
-func stream(sockPath, session string, stdinCh <-chan []byte, detachCh, winchCh <-chan struct{}) (action, error) {
+// stream runs one attach connection and returns how it ended. While attached
+// it maintains the tmux-style status bar on the terminal's bottom row (the pty
+// runs one row shorter, protected by a scroll region).
+func stream(sockPath, session string, stdinCh <-chan []byte, actionCh <-chan byte, winchCh <-chan struct{}) (action, error) {
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
 		return action{}, err
@@ -135,9 +135,22 @@ func stream(sockPath, session string, stdinCh <-chan []byte, detachCh, winchCh <
 	defer conn.Close()
 
 	cols, rows := term.Size(0)
-	if err := ipc.Write(conn, &ipc.Frame{Kind: ipc.KindAttach, Session: session, Cols: cols, Rows: rows}); err != nil {
+	barRow := 0 // 0 = terminal too small for a bar
+	ptyRows := rows
+	if rows >= 3 {
+		barRow = int(rows)
+		ptyRows = rows - 1
+	}
+	if err := ipc.Write(conn, &ipc.Frame{Kind: ipc.KindAttach, Session: session, Cols: cols, Rows: ptyRows}); err != nil {
 		return action{}, err
 	}
+	if barRow > 0 {
+		os.Stdout.WriteString(setRegion(int(ptyRows)))
+		os.Stdout.Write(statusLine(int(cols), barRow, session, time.Now()))
+		defer func() { os.Stdout.Write(clearBar(barRow)) }()
+	}
+	clock := time.NewTicker(time.Second)
+	defer clock.Stop()
 
 	frameCh := make(chan *ipc.Frame)
 	readErr := make(chan error, 1)
@@ -176,46 +189,93 @@ func stream(sockPath, session string, stdinCh <-chan []byte, detachCh, winchCh <
 				return action{kind: "closed"}, nil
 			}
 		case <-winchCh:
-			cols, rows := term.Size(0)
-			ipc.Write(conn, &ipc.Frame{Kind: ipc.KindResize, Cols: cols, Rows: rows})
-		case <-detachCh:
-			ipc.Write(conn, &ipc.Frame{Kind: ipc.KindDetach})
-			return action{kind: "detached"}, nil
+			cols, rows = term.Size(0)
+			ptyRows = rows
+			barRow = 0
+			if rows >= 3 {
+				barRow = int(rows)
+				ptyRows = rows - 1
+			}
+			ipc.Write(conn, &ipc.Frame{Kind: ipc.KindResize, Cols: cols, Rows: ptyRows})
+			if barRow > 0 {
+				os.Stdout.WriteString(setRegion(int(ptyRows)))
+				os.Stdout.Write(statusLine(int(cols), barRow, session, time.Now()))
+			} else {
+				os.Stdout.WriteString(resetRegion)
+			}
+		case <-clock.C:
+			if barRow > 0 {
+				c, _ := term.Size(0)
+				os.Stdout.Write(statusLine(int(c), barRow, session, time.Now()))
+			}
+		case a := <-actionCh:
+			switch a {
+			case actDetach:
+				ipc.Write(conn, &ipc.Frame{Kind: ipc.KindDetach})
+				return action{kind: "detached"}, nil
+			case actNext, actPrev:
+				target := sessionNeighbor(sockPath, session, a)
+				if target != "" && target != session {
+					ipc.Write(conn, &ipc.Frame{Kind: ipc.KindDetach})
+					return action{kind: "switch", session: target}, nil
+				}
+			}
 		case <-readErr:
 			return action{kind: "closed"}, nil
 		}
 	}
 }
 
-// readStdin forwards stdin to stdinCh, signalling detachCh when it sees the
-// local detach key (and dropping that byte and anything after it).
-func readStdin(stdinCh chan<- []byte, detachCh chan<- struct{}) {
+// sessionNeighbor returns the next/previous session name relative to current,
+// wrapping around ("" if the list can't be fetched or has one entry).
+func sessionNeighbor(sockPath, current string, dir byte) string {
+	stdout, _, code, err := SendCmd(sockPath, []string{"ls", "-j"})
+	if err != nil || code != 0 {
+		return ""
+	}
+	var list []struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(stdout)), &list) != nil || len(list) < 2 {
+		return ""
+	}
+	cur := 0
+	for i, s := range list {
+		if s.Name == current {
+			cur = i
+			break
+		}
+	}
+	step := 1
+	if dir == actPrev {
+		step = len(list) - 1
+	}
+	return list[(cur+step)%len(list)].Name
+}
+
+// readStdin forwards keyboard bytes to stdinCh, translating Ctrl-B prefix
+// sequences into client actions on actionCh (see keys.go).
+func readStdin(stdinCh chan<- []byte, actionCh chan<- byte) {
+	var kf keyFilter
 	buf := make([]byte, 4096)
 	for {
 		n, err := os.Stdin.Read(buf)
 		if n > 0 {
-			data := buf[:n]
-			if i := bytes.IndexByte(data, detachKey); i >= 0 {
-				if i > 0 {
-					send(stdinCh, data[:i])
-				}
+			out, actions := kf.Feed(buf[:n])
+			if len(out) > 0 {
+				cp := make([]byte, len(out))
+				copy(cp, out)
+				stdinCh <- cp
+			}
+			for _, a := range actions {
 				select {
-				case detachCh <- struct{}{}:
+				case actionCh <- a:
 				default:
 				}
-				return
 			}
-			send(stdinCh, data)
 		}
 		if err != nil {
 			return
 		}
 	}
-}
-
-// send delivers a copy of data (buf is reused by the reader).
-func send(ch chan<- []byte, data []byte) {
-	cp := make([]byte, len(data))
-	copy(cp, data)
-	ch <- cp
 }

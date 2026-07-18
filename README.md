@@ -23,9 +23,25 @@ di riduzione sono in [`docs/ANALISI.md`](docs/ANALISI.md).
 | `to` | | `<nome>` | Sposta il client attivo su un'altra sessione. |
 | `web` | | `[-t token] <porta\|host:porta>` | Interfaccia web (HTTPS): lista sessioni + terminale nel browser. |
 
-Per staccarsi dall'interno di una sessione si preme **`Ctrl-\`** (la sessione
-resta viva). In alternativa, da un altro terminale: `ivt detach <nome>`.
-`ivt help` mostra l'uso senza bisogno del server.
+## Combinazioni di tasti (prefix `Ctrl-B`, come tmux)
+
+| Tasti | Azione |
+|---|---|
+| `Ctrl-B d` | Detach: ti stacchi, la sessione resta viva |
+| `Ctrl-B n` (o `)`) | Passa alla sessione successiva |
+| `Ctrl-B p` (o `(`) | Passa alla sessione precedente |
+| `Ctrl-B Ctrl-B` | Invia un `Ctrl-B` letterale all'applicazione |
+
+Un tasto non riconosciuto dopo il prefix viene ignorato, come in tmux. Le
+stesse combinazioni funzionano anche nel terminale web. In alternativa, da un
+altro terminale: `ivt detach <nome>`. `ivt help` mostra l'uso senza server.
+
+## Status bar
+
+Quando sei attaccato, l'ultima riga dello schermo è una **status bar blu** in
+stile tmux: nome della sessione a sinistra, **ora e data** a destra. La PTY
+della sessione è alta una riga in meno e una scroll region protegge la barra
+dall'output dell'applicazione. Il terminale web ha la stessa barra.
 
 Se il processo della sessione termina mentre sei attaccato, `ivt` esce con **lo
 stesso exit code** del processo — utile negli script che lanciano agenti.
