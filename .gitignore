@@ -10,3 +10,4 @@
 # Editor
 *.swp
 .DS_Store
+/dist/
