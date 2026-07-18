@@ -19,6 +19,11 @@ const (
 
 	pushTitle = "\x1b[22;0t" // save the window title on the terminal's title stack
 	popTitle  = "\x1b[23;0t" // restore it (best effort: not every emulator supports the stack)
+
+	// clearScreen wipes the screen and homes the cursor: emitted when an
+	// attach begins (clean canvas for the session, also between Ctrl-B n/p
+	// switches) and again when it ends (clean terminal after detach/exit).
+	clearScreen = "\x1b[2J\x1b[H"
 )
 
 // setTitle sets the terminal window/tab title to the session name (OSC 0 sets
