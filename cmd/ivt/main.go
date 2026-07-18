@@ -18,6 +18,9 @@ import (
 	"github.com/ivpcode/tmr/internal/web"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 const usage = `usage: ivt <command> [args]
 
   new     | n   [name] [command [args...]]   create a session and attach to it
@@ -29,6 +32,7 @@ const usage = `usage: ivt <command> [args]
   to            <name>                       switch the active client to a session
   web           [-t token] <porta|host:porta>  web UI (HTTPS): session list + browser terminal
                   es.: web 9000 (tutte le interfacce) | web 127.0.0.1:9000 (solo locale)
+  version                                    print the ivt version
 
 Inside a session, press Ctrl-\ to detach (the session keeps running).
 Socket: $IVT_SOCK or /tmp/ivt-<uid>/default.`
@@ -48,6 +52,10 @@ func run(argv []string) int {
 	switch argv[0] {
 	case "help", "-h", "--help":
 		fmt.Println(usage)
+		return 0
+
+	case "version", "--version":
+		fmt.Println("ivt " + version)
 		return 0
 
 	case "server":
