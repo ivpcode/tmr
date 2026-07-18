@@ -110,15 +110,18 @@ func Attach(sockPath, session string) (int, error) {
 			cur = act.session
 			continue
 		case "exit":
+			os.Stdout.WriteString(clearScreen)
 			state.Restore()
 			if act.stderr != "" {
 				fmt.Fprintln(os.Stderr, "ivt: "+act.stderr)
 			}
 			return act.code, nil
 		case "closed":
+			os.Stdout.WriteString(clearScreen)
 			state.Restore()
 			return 1, fmt.Errorf("server connection lost")
 		default: // detached
+			os.Stdout.WriteString(clearScreen)
 			return 0, nil
 		}
 	}
@@ -144,6 +147,7 @@ func stream(sockPath, session string, stdinCh <-chan []byte, actionCh <-chan byt
 	if err := ipc.Write(conn, &ipc.Frame{Kind: ipc.KindAttach, Session: session, Cols: cols, Rows: ptyRows}); err != nil {
 		return action{}, err
 	}
+	os.Stdout.WriteString(clearScreen) // clean canvas before replay and bar
 	if barRow > 0 {
 		os.Stdout.WriteString(setRegion(int(ptyRows)))
 		os.Stdout.Write(statusLine(int(cols), barRow, session, time.Now()))
