@@ -16,7 +16,16 @@ const (
 	restoreCursor = "\x1b8"
 	resetRegion   = "\x1b[r"
 	barStyle      = "\x1b[0;44;97m" // bright white on blue
+
+	pushTitle = "\x1b[22;0t" // save the window title on the terminal's title stack
+	popTitle  = "\x1b[23;0t" // restore it (best effort: not every emulator supports the stack)
 )
+
+// setTitle sets the terminal window/tab title to the session name (OSC 0 sets
+// both icon and window title). Re-emitted every second, so a title set by the
+// application inside the session gets overridden — the emulator's tab always
+// shows which ivt session this is.
+func setTitle(name string) []byte { return []byte("\x1b]0;" + name + "\x07") }
 
 // setRegion confines scrolling to rows 1..n (the row below hosts the bar).
 func setRegion(n int) string { return fmt.Sprintf("\x1b[1;%dr", n) }

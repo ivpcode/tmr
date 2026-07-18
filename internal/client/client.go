@@ -149,6 +149,11 @@ func stream(sockPath, session string, stdinCh <-chan []byte, actionCh <-chan byt
 		os.Stdout.Write(statusLine(int(cols), barRow, session, time.Now()))
 		defer func() { os.Stdout.Write(clearBar(barRow)) }()
 	}
+	// Window/tab title = session name, restored when the attach ends.
+	os.Stdout.WriteString(pushTitle)
+	os.Stdout.Write(setTitle(session))
+	defer os.Stdout.WriteString(popTitle)
+
 	clock := time.NewTicker(time.Second)
 	defer clock.Stop()
 
@@ -208,6 +213,7 @@ func stream(sockPath, session string, stdinCh <-chan []byte, actionCh <-chan byt
 				c, _ := term.Size(0)
 				os.Stdout.Write(statusLine(int(c), barRow, session, time.Now()))
 			}
+			os.Stdout.Write(setTitle(session))
 		case a := <-actionCh:
 			switch a {
 			case actDetach:
