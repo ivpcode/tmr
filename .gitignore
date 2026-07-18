@@ -1,0 +1,12 @@
+# Binaries
+/ivt
+/tmr
+*.exe
+
+# Test/coverage output
+*.out
+*.test
+
+# Editor
+*.swp
+.DS_Store
